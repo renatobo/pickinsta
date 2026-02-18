@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; if [[ \"$FILE\" == *.py ]]; then cd /Users/renatobo/development/pickinsta && .venv/bin/python -m ruff check --fix \"$FILE\" 2>/dev/null; .venv/bin/python -m ruff format \"$FILE\" 2>/dev/null; fi; true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "FILE=\"$CLAUDE_TOOL_INPUT_FILE_PATH\"; if [[ \"$FILE\" == *\".env\" ]] && [[ \"$FILE\" != *\".env.example\" ]]; then echo 'Blocked: do not edit .env files directly'; exit 2; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -25,7 +25,7 @@ The core pipeline in `src/pickinsta/ig_image_selector.py` processes images throu
 - Ensures crops keep the full subject in frame (previously used unreliable saliency detection)
 - YOLO context is passed to Claude to improve scoring accuracy
 - Graceful fallback to saliency detection if YOLO finds nothing
-- See `YOLO_CLAUDE_INTEGRATION.md` for details
+- See `debug/README.md` and `debug/debug_yolo_claude.py` for debugging details
 
 **Dual Scorer Architecture**:
 - **CLIP** (`--scorer clip`): Free, local, zero-shot classification. Uses 4 positive + 2 negative prompts. Maps logits to 0-60 scale to match Claude's range.
@@ -54,71 +54,61 @@ Smart cropping uses these rules to:
 
 ## Development Commands
 
+```bash
+make install-dev        # Install dev dependencies (pytest, ruff, pre-commit)
+make test               # Run pytest suite
+make lint               # Run ruff linting checks
+make format             # Auto-format with ruff
+make check              # lint + test (run before committing)
+make pre-commit-install # Install pre-commit hooks (ruff + formatting on git commit)
+```
+
 ### Installation
 
 ```bash
-# Create and activate virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install base + both scorers
-python -m pip install --upgrade pip setuptools
-python -m pip install -e ".[clip,claude]"
-
-# Or install individual scorers
-python -m pip install -e ".[clip]"    # CLIP only
-python -m pip install -e ".[claude]"  # Claude only
-python -m pip install -e ".[yolo]"    # YOLO support (recommended)
-
-# Verify installation
-python -c "import transformers, torch, anthropic; print(transformers.__version__, torch.__version__, anthropic.__version__)"
+python3 -m venv .venv && source .venv/bin/activate
+make install-dev
+python -m pip install -e ".[clip,claude,yolo]"
 ```
+
+Optional scorers can be installed individually: `.[clip]`, `.[claude]`, `.[yolo]`.
 
 ### Running the Pipeline
 
 ```bash
-# Basic usage (CLIP scorer, top 10)
+# CLIP scorer (free, local), top 10
 pickinsta ./input --output ./selected --top 10 --scorer clip
 
-# Claude scorer with all images analyzed
-pickinsta ./input --output ./selected --scorer claude --all
+# Claude scorer, all images, with Claude-guided crop ordering
+pickinsta ./input --output ./selected --scorer claude --all --claude-crop-first
 
-# As module
-python -m pickinsta ./input --scorer claude --top 5
-
-# Override Claude model
-pickinsta ./input --scorer claude --claude-model claude-sonnet-4-5
+# As module / override model
+python -m pickinsta ./input --scorer claude --claude-model claude-sonnet-4-6
 ```
 
 ### Environment Setup
 
-Create `.env` file for Claude API key:
-
 ```bash
 cp .env.example .env
-# Edit .env and set:
-ANTHROPIC_API_KEY=your_key_here
-# Optional:
-HF_TOKEN=hf_xxx  # Reduces HuggingFace warnings
-ANTHROPIC_MODEL=claude-sonnet-4-5  # Override default model
 ```
 
-`.env` search order: current environment → cwd/.env → input_folder/.env
+`.env` search order: current environment → `cwd/.env` → `input_folder/.env`
+
+Key variables:
+- `ANTHROPIC_API_KEY` — required for Claude scorer
+- `ANTHROPIC_MODEL` — override default model (default: `claude-sonnet-4-6`)
+- `HF_TOKEN` — reduces HuggingFace rate limit warnings (CLIP)
+- `PICKINSTA_ACCOUNT_CONTEXT` — custom account context injected into Claude prompts
+- `PICKINSTA_YOLO_MODEL` — override YOLO model path (default: `~/.cache/pickinsta/models/yolov8n.pt`)
 
 ### Testing
 
 ```bash
-# Run all tests
-pytest
+pytest                            # Run all tests
+pytest tests/test_crop.py        # Single test file
+pytest -k "test_smart_crop"      # Single test by name
 
-# Test smart cropping with debug visualization
-python tests/test_crop.py
-
-# Test full integration (YOLO + cropping)
-python tests/test_full_integration.py
-
-# Debug YOLO + Claude prompt enhancement (manual debug script)
-python debug/debug_yolo_claude.py
+python debug/debug_yolo_claude.py  # Manual debug: inspect YOLO → Claude prompt enrichment
 ```
 
 Debug mode creates visualizations showing:
@@ -129,12 +119,10 @@ Debug mode creates visualizations showing:
 
 ## Important File Locations
 
-- **Main entry**: `src/pickinsta/ig_image_selector.py` (1700+ lines, all pipeline logic)
-- **Package init**: `src/pickinsta/__init__.py` (exports `__version__`)
-- **CLI entry**: `src/pickinsta/__main__.py` (calls main())
-- **Config**: `pyproject.toml` (defines `pickinsta` console script, optional dependencies)
-- **Tests**: `tests/` (pytest-based, includes integration tests)
-- **Docs**: `YOLO_CLAUDE_INTEGRATION.md`, `ENHANCEMENT_SUMMARY.md`, `docs/composition-rules.md`
+- **Main pipeline**: `src/pickinsta/ig_image_selector.py` (~2,500 lines, all 5 stages + CLI)
+- **CLIP scorer**: `src/pickinsta/clip_scorer.py` (separate module, loaded lazily on `--scorer clip`)
+- **Config**: `pyproject.toml` (defines `pickinsta` console script, optional dependencies, ruff config)
+- **Docs**: `docs/composition-rules.md` (technical scoring weights, cropping heuristics)
 
 ## Common Tasks
 
@@ -158,7 +146,7 @@ Debug mode creates visualizations showing:
 
 ### Supporting New Image Formats
 
-Add extension to `SUPPORTED_EXTENSIONS` set (line 51). Ensure PIL can open the format.
+Add extension to `SUPPORTED_EXTENSIONS` set (line 53). Ensure PIL can open the format.
 
 ## Troubleshooting
 
