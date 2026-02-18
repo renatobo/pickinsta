@@ -1,4 +1,8 @@
 # pickinsta
+[![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/renatobo/pickinsta/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/renatobo/pickinsta/actions/workflows/ci.yml)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
 
 Instagram image selection pipeline package.
 
