@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pickinsta"
+version = "1.0.0"
+description = "Instagram image selection pipeline."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Renato Bonomini" }]
+dependencies = [
+  "Pillow>=10.0.0",
+  "opencv-python>=4.10.0",
+  "numpy>=1.26.0",
+  "ImageHash>=4.3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.9.0", "pre-commit>=4.0.0"]
+clip = ["transformers>=4.40.0", "torch>=2.0.0"]
+claude = ["anthropic>=0.40.0", "tqdm>=4.66.0"]
+yolo = ["ultralytics>=8.0.0"]
+
+[project.scripts]
+pickinsta = "pickinsta.ig_image_selector:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F"]

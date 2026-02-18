@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2580" height="760" viewBox="0 0 2580 760" role="img" aria-labelledby="title desc">
+  <title id="title">pickinsta high-level pipeline</title>
+  <desc id="desc">Left-to-right pipeline from messy photo dump to final ranked Instagram portraits.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .col { fill: #ffffff; stroke: #d1d9e6; stroke-width: 2; rx: 14; }
+      .title { font: 700 22px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #1f2a44; }
+      .subtitle { font: 600 18px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #1f2a44; }
+      .body { font: 500 14px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #3b4a6b; }
+      .small { font: 500 12px 'Helvetica Neue', Helvetica, Arial, sans-serif; fill: #5a6786; }
+      .img { fill: #e8edf7; stroke: #b5c1d8; stroke-width: 1.5; rx: 8; }
+      .img-dup { fill: #ffe8e8; stroke: #ef9999; stroke-width: 1.5; rx: 8; }
+      .img-bad { fill: #fff4da; stroke: #efc06b; stroke-width: 1.5; rx: 8; }
+      .img-good { fill: #e8f7ec; stroke: #88c999; stroke-width: 1.5; rx: 8; }
+      .chip { fill: #edf2ff; stroke: #c6d4ff; stroke-width: 1.2; rx: 8; }
+      .arrow { stroke: #6b7fa8; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .metric { fill: #d9e3f6; rx: 3; }
+      .metric-ok { fill: #82b1ff; rx: 3; }
+    </style>
+    <marker id="arrowhead" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto">
+      <polygon points="0 0, 12 4, 0 8" fill="#6b7fa8" />
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="2580" height="760" />
+  <text class="title" x="36" y="48">pickinsta pipeline overview (left to right)</text>
+
+  <!-- Column 1: Raw input -->
+  <rect class="col" x="30" y="80" width="330" height="640" />
+  <text class="subtitle" x="50" y="118">Raw input dump</text>
+  <text class="body" x="50" y="146">Mixed quality + mixed framing</text>
+  <rect class="img-dup" x="52" y="176" width="120" height="80" />
+  <text class="small" x="63" y="220">bike_turn_0163.jpg</text>
+  <rect class="img-dup" x="188" y="176" width="120" height="80" />
+  <text class="small" x="199" y="220">bike_turn_0164.jpg</text>
+  <text class="small" x="56" y="272">near-duplicate pair</text>
+
+  <rect class="img-bad" x="52" y="296" width="66" height="120" />
+  <text class="small" x="56" y="430">wrong aspect</text>
+  <rect class="img-bad" x="130" y="296" width="178" height="120" />
+  <text class="small" x="136" y="356">parking lot / low-interest</text>
+
+  <rect class="img-good" x="52" y="448" width="120" height="80" />
+  <text class="small" x="63" y="492">rider_action.jpg</text>
+  <rect class="img" x="188" y="448" width="120" height="80" />
+  <text class="small" x="197" y="492">group_shot.jpg</text>
+
+  <text class="body" x="50" y="575">Start with many images:</text>
+  <text class="small" x="50" y="600">- duplicates</text>
+  <text class="small" x="50" y="622">- odd aspect ratios</text>
+  <text class="small" x="50" y="644">- uninteresting content</text>
+
+  <!-- Column 2: Stage 0 -->
+  <rect class="col" x="390" y="80" width="330" height="640" />
+  <text class="subtitle" x="410" y="118">Stage 0: Resize</text>
+  <text class="body" x="410" y="146">Normalize for faster compute</text>
+  <rect class="chip" x="410" y="180" width="280" height="46" />
+  <text class="body" x="424" y="208">EXIF-safe orientation fix</text>
+  <rect class="chip" x="410" y="238" width="280" height="46" />
+  <text class="body" x="424" y="266">Longest edge &lt;= 1920px</text>
+  <rect class="chip" x="410" y="296" width="280" height="46" />
+  <text class="body" x="424" y="324">Uniform JPEG work copies</text>
+  <rect class="img" x="430" y="378" width="250" height="180" />
+  <text class="body" x="448" y="460">input_work/*.jpg</text>
+  <text class="small" x="410" y="608">Output: resized, standardized files</text>
+
+  <!-- Column 3: Stage 1 -->
+  <rect class="col" x="750" y="80" width="330" height="640" />
+  <text class="subtitle" x="770" y="118">Stage 1: Deduplicate</text>
+  <text class="body" x="770" y="146">Perceptual hash grouping</text>
+  <rect class="img-dup" x="790" y="190" width="120" height="74" />
+  <rect class="img-dup" x="840" y="214" width="120" height="74" opacity="0.85" />
+  <text class="small" x="786" y="286">Group A (near-duplicates)</text>
+  <text class="body" x="770" y="330">Keep best representative</text>
+  <rect class="img-good" x="790" y="356" width="170" height="96" />
+  <text class="small" x="808" y="410">largest/highest quality</text>
+  <rect class="chip" x="770" y="500" width="280" height="48" />
+  <text class="body" x="786" y="530">N images -> fewer unique images</text>
+  <text class="small" x="770" y="608">Output: unique candidate set</text>
+
+  <!-- Column 4: Stage 2 -->
+  <rect class="col" x="1110" y="80" width="330" height="640" />
+  <text class="subtitle" x="1130" y="118">Stage 2: Technical scoring</text>
+  <text class="body" x="1130" y="146">OpenCV metrics per image</text>
+  <text class="small" x="1130" y="190">sharpness</text>
+  <rect class="metric" x="1215" y="178" width="190" height="12" />
+  <rect class="metric-ok" x="1215" y="178" width="150" height="12" />
+  <text class="small" x="1130" y="218">lighting</text>
+  <rect class="metric" x="1215" y="206" width="190" height="12" />
+  <rect class="metric-ok" x="1215" y="206" width="132" height="12" />
+  <text class="small" x="1130" y="246">composition</text>
+  <rect class="metric" x="1215" y="234" width="190" height="12" />
+  <rect class="metric-ok" x="1215" y="234" width="166" height="12" />
+  <text class="small" x="1130" y="274">color harmony</text>
+  <rect class="metric" x="1215" y="262" width="190" height="12" />
+  <rect class="metric-ok" x="1215" y="262" width="138" height="12" />
+  <text class="small" x="1130" y="302">visual clutter</text>
+  <rect class="metric" x="1215" y="290" width="190" height="12" />
+  <rect class="metric-ok" x="1215" y="290" width="118" height="12" />
+  <rect class="chip" x="1130" y="346" width="280" height="50" />
+  <text class="body" x="1148" y="377">technical_composite (0.0-1.0)</text>
+  <rect class="chip" x="1130" y="416" width="280" height="50" />
+  <text class="body" x="1148" y="447">Sort descending by quality</text>
+  <text class="small" x="1130" y="608">Output: ranked technical shortlist</text>
+
+  <!-- Column 5: Stage 3 -->
+  <rect class="col" x="1470" y="80" width="330" height="640" />
+  <text class="subtitle" x="1490" y="118">Stage 3: Vision scoring</text>
+  <text class="body" x="1490" y="146">Aesthetic + Instagram potential</text>
+  <rect class="chip" x="1490" y="182" width="130" height="46" />
+  <text class="body" x="1522" y="210">CLIP</text>
+  <rect class="chip" x="1638" y="182" width="130" height="46" />
+  <text class="body" x="1664" y="210">Claude</text>
+  <rect class="chip" x="1490" y="244" width="278" height="46" />
+  <text class="body" x="1508" y="272">Claude cache (*.pickinsta.json)</text>
+  <rect class="chip" x="1490" y="306" width="278" height="46" />
+  <text class="body" x="1508" y="334">YOLO context for subject hints</text>
+  <rect class="chip" x="1490" y="368" width="278" height="58" />
+  <text class="body" x="1508" y="396">final = 0.3 * technical</text>
+  <text class="body" x="1508" y="418">      + 0.7 * vision_normalized</text>
+  <text class="small" x="1490" y="608">Output: final-ranked candidates</text>
+
+  <!-- Column 6: Stage 4 -->
+  <rect class="col" x="1830" y="80" width="330" height="640" />
+  <text class="subtitle" x="1850" y="118">Stage 4: Smart crop</text>
+  <text class="body" x="1850" y="146">Create Instagram portrait outputs</text>
+  <rect class="img" x="1868" y="190" width="254" height="138" />
+  <rect x="1942" y="226" width="90" height="72" fill="none" stroke="#4caf50" stroke-width="3" />
+  <text class="small" x="1878" y="344">YOLO bbox keeps subject in-frame</text>
+  <rect class="chip" x="1850" y="376" width="280" height="48" />
+  <text class="body" x="1870" y="406">Crop + resize to 1080 x 1440</text>
+  <rect class="chip" x="1850" y="438" width="280" height="48" />
+  <text class="body" x="1870" y="468">Fallback: saliency / center crop</text>
+  <text class="small" x="1850" y="608">Output: production-ready portrait files</text>
+
+  <!-- Column 7: Output -->
+  <rect class="col" x="2190" y="80" width="330" height="640" />
+  <text class="subtitle" x="2210" y="118">Final deliverables</text>
+  <text class="body" x="2210" y="146">Top N selected outputs</text>
+  <rect class="img-good" x="2225" y="186" width="86" height="140" />
+  <rect class="img-good" x="2320" y="186" width="86" height="140" />
+  <rect class="img-good" x="2415" y="186" width="86" height="140" />
+  <text class="small" x="2242" y="344">01</text>
+  <text class="small" x="2338" y="344">02</text>
+  <text class="small" x="2433" y="344">03</text>
+  <rect class="chip" x="2210" y="390" width="280" height="50" />
+  <text class="body" x="2230" y="421">selection_report.json</text>
+  <rect class="chip" x="2210" y="454" width="280" height="50" />
+  <text class="body" x="2230" y="485">selection_report.md</text>
+  <text class="small" x="2210" y="608">Result: Instagram-ready shortlist</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M360 402 L390 402" />
+  <path class="arrow" d="M720 402 L750 402" />
+  <path class="arrow" d="M1080 402 L1110 402" />
+  <path class="arrow" d="M1440 402 L1470 402" />
+  <path class="arrow" d="M1800 402 L1830 402" />
+  <path class="arrow" d="M2160 402 L2190 402" />
+</svg>
