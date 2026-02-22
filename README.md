@@ -45,10 +45,12 @@ flowchart TD
     J -->|yes| K["Use cached Claude score"]
     J -->|no| L["Claude vision scoring<br/>Optional YOLO context for subject info"]
     L --> M["Save cache entry"]
+    F -->|ollama| Q["Resolve Ollama base URL + model<br/>Optional YOLO context"]
 
     G --> N["Final score<br/>0.3 * technical + 0.7 * vision"]
     K --> N
     M --> N
+    Q --> N
 
     N --> O["Stage 4: Smart crop<br/>YOLO-guided crop to 1080x1440<br/>Fallback: saliency/center"]
     O --> P["Output top N images + reports<br/>selection_report.json and selection_report.md<br/>Optional *_full_* fallback only for uncertain crops"]
@@ -146,7 +148,7 @@ Performance defaults for Ollama are tuned for remote servers:
 - `PICKINSTA_OLLAMA_MAX_IMAGE_EDGE=1024` and `PICKINSTA_OLLAMA_JPEG_QUALITY=80`
 - `PICKINSTA_OLLAMA_KEEP_ALIVE=10m` (keeps model loaded between requests)
 - `PICKINSTA_OLLAMA_USE_YOLO_CONTEXT=false` (set `true` for higher quality, slower)
-- `PICKINSTA_OLLAMA_CONCURRENCY=2` (parallel requests; try 2-4 on M1)
+- `PICKINSTA_OLLAMA_CONCURRENCY=2` (parallel requests; start at 2-4 and tune per host)
 - `PICKINSTA_OLLAMA_MAX_RETRIES=2` with `PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC=0.75`
 - `PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6` (stops submitting new requests when the server is unhealthy)
 
@@ -217,7 +219,7 @@ Benchmark multiple Ollama models for processing speed (manual comparison report)
 
 Reports are written to `./selected`:
 - `selection_report.json` (top selected outputs)
-- `selection_report.md` (top outputs + full vision/Claude scores for all analyzed images)
+- `selection_report.md` (top outputs + full technical and vision scores for all analyzed images)
 
 Output files:
 - `NN_<image-stem>.jpg` (always, ranked crop output)

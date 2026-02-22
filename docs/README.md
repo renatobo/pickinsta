@@ -9,7 +9,7 @@ For contributor workflow and PR expectations, see `../CONTRIBUTING.md`.
   - Detailed composition, scoring, and cropping rules used by the pipeline.
   - Source reference for technical scoring weights and smart-crop heuristics.
 - `troubleshooting.md`
-  - Setup/runtime troubleshooting for CLIP and Claude scorers.
+  - Setup/runtime troubleshooting for CLIP, Claude, and Ollama scorers.
 - `ollama-server-setup.md`
   - Quick macOS/Linux setup guide for self-hosted Ollama servers used by `--scorer ollama`.
   - Includes short CLI examples, model pull/setup notes, and manual model-speed benchmark command.

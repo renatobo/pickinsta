@@ -47,6 +47,7 @@ Run a single file:
   - Technical batch ranking behavior
   - CLIP scoring/fallback behavior
   - Claude path validation, including Anthropic API key wiring
+  - Ollama response parsing, retry/circuit-breaker behavior, and env wiring
 
 ## Notes
 

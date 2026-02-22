@@ -126,7 +126,7 @@ In your `.env`:
 
 ```bash
 PICKINSTA_OLLAMA_BASE_URL=http://YOUR_SERVER_IP:11434
-PICKINSTA_OLLAMA_MODEL=qwen3-vl:8b
+PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b
 ```
 
 Run:
@@ -137,22 +137,49 @@ pickinsta ./input --output ./selected --scorer ollama --all
 
 ## 5. Simple remote test from your local machine
 
-Assuming Ollama is running on your M1 machine and reachable on your network:
+Assuming Ollama is reachable on your network:
 
 ```bash
-curl http://<M1_IP>:11434/api/generate \
-  -d '{"model": "qwen3-vl:8b", "prompt": "Hello", "stream": false}'
+curl http://<SERVER_IP>:11434/api/generate \
+  -d '{"model": "qwen2.5vl:7b", "prompt": "Hello", "stream": false}'
 ```
 
 Optional environment variable form:
 
 ```bash
-export PICKINSTA_OLLAMA_HOST_URL="http://<M1_IP>:11434"
+export PICKINSTA_OLLAMA_HOST_URL="http://<SERVER_IP>:11434"
 curl "${PICKINSTA_OLLAMA_HOST_URL}/api/generate" \
-  -d '{"model": "qwen3-vl:8b", "prompt": "Hello", "stream": false}'
+  -d '{"model": "qwen2.5vl:7b", "prompt": "Hello", "stream": false}'
 ```
 
-## 6. Run the 4-model manual speed benchmark
+## 6. Throughput tuning (CPU and mixed workloads)
+
+Start with conservative parallelism and tune using benchmark throughput (`sec/img`):
+
+```ini
+[Service]
+Environment="OLLAMA_NUM_PARALLEL=4"
+Environment="OLLAMA_NUM_THREAD=3"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+```
+
+Then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+On the `pickinsta` side, increase request concurrency carefully:
+
+```bash
+export PICKINSTA_OLLAMA_CONCURRENCY=4
+```
+
+Note: CPU utilization near 50% on hyper-threaded CPUs can still be near peak
+inference throughput; optimize for benchmark speed rather than raw CPU%.
+
+## 7. Run the 4-model manual speed benchmark
 
 From the project root:
 
@@ -173,7 +200,7 @@ The report compares:
 - average run duration
 - failures per run
 
-## 7. Save per-model outputs in separate folders (scored images + reports)
+## 8. Save per-model outputs in separate folders (scored images + reports)
 
 Use this when you want full result artifacts per model and per run, not only speed tables.
 
