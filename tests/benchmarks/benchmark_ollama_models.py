@@ -111,7 +111,11 @@ def _benchmark_model(
     }
     with patched_env(env):
         if warmup:
-            _run_once(candidates=candidates, src=src)
+            # Warm model cache with a single image only (avoid full-pass warmup cost).
+            warmup_candidates = candidates[:1]
+            if warmup_candidates:
+                _run_once(candidates=warmup_candidates, src=src)
+                time.sleep(10)
         for run_idx in range(1, runs + 1):
             duration, images_count, failed_count = _run_once(candidates=candidates, src=src)
             metrics.append(
@@ -253,7 +257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-warmup",
         action="store_true",
-        help="Disable per-model warmup run before timed runs.",
+        help="Disable per-model warmup (default warmup scores 1 image, then waits 10s).",
     )
     parser.add_argument(
         "--report",
