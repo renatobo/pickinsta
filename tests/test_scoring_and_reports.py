@@ -210,3 +210,103 @@ def test_batch_vision_score_claude_applies_strong_crop_gate(tmp_path, monkeypatc
     assert ranked[0].final_score == base
     assert ranked[1].path.name == "low.jpg"
     assert ranked[1].final_score == base * 0.15
+
+
+def test_batch_vision_score_ollama_uses_resolved_server_and_model(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "candidate.jpg"
+    image_file.write_bytes(b"image-bytes")
+    candidate = ImageScore(path=image_file, source_path=image_file, technical={"composite": 0.5})
+
+    observed = {"base_url": None, "model": None}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            return b'{"models":[]}'
+
+    monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(selector, "resolve_ollama_base_url", lambda search_dir=None: "http://remote:11434")
+    monkeypatch.setattr(selector, "resolve_ollama_model", lambda search_dir=None: "qwen2.5vl:7b")
+    monkeypatch.setattr(selector, "resolve_ollama_keep_alive", lambda search_dir=None: "10m")
+    monkeypatch.setattr(selector, "resolve_account_context", lambda search_dir=None: "motorcycle account")
+
+    def fake_score_with_ollama(
+        path: Path,
+        *,
+        base_url,
+        model,
+        use_yolo_context,
+        prompt,
+        timeout_seconds,
+        max_image_edge,
+        jpeg_quality,
+        keep_alive,
+    ):
+        observed["base_url"] = base_url
+        observed["model"] = model
+        assert use_yolo_context is False
+        assert "motorcycle account" in prompt
+        assert path == image_file
+        assert timeout_seconds >= 300
+        assert max_image_edge == 1024
+        assert jpeg_quality == 80
+        assert keep_alive == "10m"
+        return {"total": 48, "crop_4x5": 9, "one_line": "Ollama verified"}
+
+    monkeypatch.setattr(selector, "score_with_ollama", fake_score_with_ollama)
+
+    ranked = selector.batch_vision_score([candidate], scorer="ollama")
+
+    assert observed["base_url"] == "http://remote:11434"
+    assert observed["model"] == "qwen2.5vl:7b"
+    assert ranked[0].final_score == 0.5 * 0.3 + (48 / 60.0) * 0.7
+    assert ranked[0].one_line == "Ollama verified"
+
+
+def test_batch_vision_score_ollama_retries_and_succeeds(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "retry.jpg"
+    image_file.write_bytes(b"image-bytes")
+    candidate = ImageScore(path=image_file, source_path=image_file, technical={"composite": 0.4})
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            return b'{"models":[]}'
+
+    attempts = {"n": 0}
+
+    monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(selector, "resolve_ollama_base_url", lambda search_dir=None: "http://remote:11434")
+    monkeypatch.setattr(selector, "resolve_ollama_model", lambda search_dir=None: "qwen2.5vl:7b")
+    monkeypatch.setattr(selector, "resolve_ollama_keep_alive", lambda search_dir=None: "10m")
+    monkeypatch.setattr(selector, "resolve_account_context", lambda search_dir=None: "motorcycle account")
+    monkeypatch.setattr(selector, "resolve_ollama_concurrency", lambda: 1)
+    monkeypatch.setattr(selector, "resolve_ollama_max_retries", lambda: 2)
+    monkeypatch.setattr(selector, "resolve_ollama_retry_backoff_seconds", lambda: 0.01)
+    monkeypatch.setattr(selector, "resolve_ollama_circuit_breaker_errors", lambda: 6)
+    monkeypatch.setattr(selector.time, "sleep", lambda _sec: None)
+
+    def flaky_score(*_args, **_kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("Ollama request failed (500)")
+        return {"total": 42, "crop_4x5": 8, "one_line": "Recovered after retry"}
+
+    monkeypatch.setattr(selector, "score_with_ollama", flaky_score)
+
+    ranked = selector.batch_vision_score([candidate], scorer="ollama")
+
+    assert attempts["n"] == 2
+    expected = (0.4 * 0.3 + (42 / 60.0) * 0.7) * 1.0
+    assert ranked[0].final_score == expected
+    assert ranked[0].one_line == "Recovered after retry"

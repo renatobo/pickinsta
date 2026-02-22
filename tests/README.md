@@ -52,5 +52,7 @@ Run a single file:
 
 - Tests are designed to be deterministic and fast.
 - External services/models (Anthropic, CLIP downloads, YOLO downloads) are mocked in tests.
+- `tests/benchmarks/benchmark_ollama_yolo.py` is a manual benchmark script and is not part of the standard `pytest` runbook.
+- `tests/benchmarks/benchmark_ollama_models.py` is a manual benchmark script for cross-model speed comparisons and is not part of the standard `pytest` runbook.
 - Manual debug scripts and debug output artifacts are in:
   - `/Users/renatobo/development/pickinsta/debug`

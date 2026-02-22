@@ -29,14 +29,19 @@ Requirements:
 """
 
 import argparse
+import base64
 import hashlib
+import io
 import json
 import os
 import sys
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
-from urllib.request import urlretrieve
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen, urlretrieve
 
 import cv2
 import numpy as np
@@ -53,9 +58,22 @@ OUTPUT_HEIGHT = 1440  # Instagram output height (3:4 ratio)
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".tiff", ".bmp"}
 DEDUP_THRESHOLD = 8  # perceptual hash distance; lower = stricter
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
+DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 CLAUDE_MIN_CROP4X5_OUTPUT_SCORE = 6.0
 DEFAULT_ACCOUNT_CONTEXT = "motorcycle enthusiast account"
 ACCOUNT_CONTEXT_ENV_VAR = "PICKINSTA_ACCOUNT_CONTEXT"
+PICKINSTA_OLLAMA_BASE_URL_ENV_VAR = "PICKINSTA_OLLAMA_BASE_URL"
+PICKINSTA_OLLAMA_MODEL_ENV_VAR = "PICKINSTA_OLLAMA_MODEL"
+OLLAMA_TIMEOUT_ENV_VAR = "PICKINSTA_OLLAMA_TIMEOUT_SEC"
+OLLAMA_MAX_EDGE_ENV_VAR = "PICKINSTA_OLLAMA_MAX_IMAGE_EDGE"
+OLLAMA_JPEG_QUALITY_ENV_VAR = "PICKINSTA_OLLAMA_JPEG_QUALITY"
+OLLAMA_KEEP_ALIVE_ENV_VAR = "PICKINSTA_OLLAMA_KEEP_ALIVE"
+OLLAMA_USE_YOLO_ENV_VAR = "PICKINSTA_OLLAMA_USE_YOLO_CONTEXT"
+OLLAMA_CONCURRENCY_ENV_VAR = "PICKINSTA_OLLAMA_CONCURRENCY"
+OLLAMA_MAX_RETRIES_ENV_VAR = "PICKINSTA_OLLAMA_MAX_RETRIES"
+OLLAMA_BACKOFF_BASE_ENV_VAR = "PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC"
+OLLAMA_CIRCUIT_BREAKER_ENV_VAR = "PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS"
 YOLO_MODEL_FILENAME = "yolov8n.pt"
 YOLO_MODEL_URL = "https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt"
 YOLO_MODEL_ENV_VAR = "PICKINSTA_YOLO_MODEL"
@@ -180,6 +198,121 @@ def resolve_claude_model(cli_model: Optional[str] = None) -> str:
     return (
         os.environ.get("ANTHROPIC_MODEL") or os.environ.get("CLAUDE_MODEL") or DEFAULT_CLAUDE_MODEL
     )
+
+
+def _resolve_env_string(var_name: str, search_dir: Optional[Path] = None) -> Optional[str]:
+    """Resolve a string env var from environment first, then .env files."""
+    env_value = (os.environ.get(var_name) or "").strip()
+    if env_value:
+        return env_value
+
+    candidates = [Path.cwd() / ".env"]
+    if search_dir is not None:
+        candidates.append(search_dir / ".env")
+
+    seen: set[Path] = set()
+    for env_file in candidates:
+        resolved = env_file.resolve()
+        if resolved in seen or not env_file.exists():
+            continue
+        seen.add(resolved)
+
+        values = _read_env_file(env_file)
+        value = (values.get(var_name) or "").strip()
+        if value:
+            os.environ.setdefault(var_name, value)
+            print(f"  📝 Loaded {var_name} from {env_file}")
+            return value
+    return None
+
+
+def resolve_ollama_base_url(search_dir: Optional[Path] = None) -> str:
+    """Resolve Ollama base URL from env or fallback default."""
+    return (
+        _resolve_env_string(PICKINSTA_OLLAMA_BASE_URL_ENV_VAR, search_dir=search_dir)
+        or DEFAULT_OLLAMA_BASE_URL
+    )
+
+
+def resolve_ollama_model(search_dir: Optional[Path] = None) -> str:
+    """Resolve Ollama model from env or fallback default."""
+    return _resolve_env_string(PICKINSTA_OLLAMA_MODEL_ENV_VAR, search_dir=search_dir) or DEFAULT_OLLAMA_MODEL
+
+
+def _resolve_env_int(var_name: str, default: int) -> int:
+    raw = (os.environ.get(var_name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _resolve_env_float(var_name: str, default: float) -> float:
+    raw = (os.environ.get(var_name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _resolve_env_bool(var_name: str, default: bool) -> bool:
+    raw = (os.environ.get(var_name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def resolve_ollama_timeout_seconds() -> int:
+    """Resolve request timeout for Ollama API calls."""
+    return max(30, _resolve_env_int(OLLAMA_TIMEOUT_ENV_VAR, 300))
+
+
+def resolve_ollama_max_image_edge() -> int:
+    """Resolve max edge for image payload sent to Ollama."""
+    return max(256, _resolve_env_int(OLLAMA_MAX_EDGE_ENV_VAR, 1024))
+
+
+def resolve_ollama_jpeg_quality() -> int:
+    """Resolve JPEG quality used for Ollama payload encoding."""
+    return min(95, max(30, _resolve_env_int(OLLAMA_JPEG_QUALITY_ENV_VAR, 80)))
+
+
+def resolve_ollama_keep_alive(search_dir: Optional[Path] = None) -> str:
+    """Resolve Ollama keep_alive duration to keep model warm between requests."""
+    return _resolve_env_string(OLLAMA_KEEP_ALIVE_ENV_VAR, search_dir=search_dir) or "10m"
+
+
+def resolve_ollama_use_yolo_context() -> bool:
+    """Resolve whether to run YOLO context before Ollama scoring."""
+    return _resolve_env_bool(OLLAMA_USE_YOLO_ENV_VAR, False)
+
+
+def resolve_ollama_concurrency() -> int:
+    """Resolve parallel request count for Ollama scoring."""
+    return min(16, max(1, _resolve_env_int(OLLAMA_CONCURRENCY_ENV_VAR, 2)))
+
+
+def resolve_ollama_max_retries() -> int:
+    """Resolve max retry attempts per Ollama request."""
+    return min(8, max(0, _resolve_env_int(OLLAMA_MAX_RETRIES_ENV_VAR, 2)))
+
+
+def resolve_ollama_retry_backoff_seconds() -> float:
+    """Resolve base exponential backoff between retries."""
+    return min(10.0, max(0.05, _resolve_env_float(OLLAMA_BACKOFF_BASE_ENV_VAR, 0.75)))
+
+
+def resolve_ollama_circuit_breaker_errors() -> int:
+    """Resolve consecutive-error threshold before halting new submissions."""
+    return min(50, max(1, _resolve_env_int(OLLAMA_CIRCUIT_BREAKER_ENV_VAR, 6)))
 
 
 def resolve_account_context(search_dir: Optional[Path] = None) -> str:
@@ -950,7 +1083,7 @@ def score_with_claude(
 
     # Read and encode — images are already resized to max 1920px
     with open(image_path, "rb") as f:
-        image_data = __import__("base64").standard_b64encode(f.read()).decode("utf-8")
+        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
 
     suffix = image_path.suffix.lower()
     media_type = "image/png" if suffix == ".png" else "image/jpeg"
@@ -978,10 +1111,146 @@ def score_with_claude(
     )
 
     raw = response.content[0].text.strip()
-    # Strip markdown fences if present
+    return json.loads(_extract_json_payload(raw))
+
+
+def _extract_json_payload(raw_text: str) -> str:
+    """Extract JSON body from a model response that may include code fences."""
+    raw = raw_text.strip()
     if raw.startswith("```"):
         raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    return json.loads(raw)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return raw[start : end + 1]
+    return raw
+
+
+def _encode_image_for_ollama(
+    image_path: Path,
+    *,
+    max_edge: int,
+    jpeg_quality: int,
+) -> str:
+    """Encode image as base64, downscaling/compressing to reduce Ollama payload size."""
+    try:
+        with Image.open(image_path) as img:
+            rgb = img.convert("RGB")
+            w, h = rgb.size
+            longest = max(w, h)
+            if longest > max_edge:
+                scale = max_edge / float(longest)
+                new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                rgb = rgb.resize(new_size, Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            rgb.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+            return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        with open(image_path, "rb") as f:
+            return base64.standard_b64encode(f.read()).decode("utf-8")
+
+
+def score_with_ollama(
+    image_path: Path,
+    base_url: str,
+    model: str = DEFAULT_OLLAMA_MODEL,
+    use_yolo_context: bool = True,
+    prompt: Optional[str] = None,
+    timeout_seconds: int = 300,
+    max_image_edge: int = 1024,
+    jpeg_quality: int = 80,
+    keep_alive: str = "10m",
+) -> dict:
+    """Score a single image using Ollama's vision API (/api/chat)."""
+    yolo_context = ""
+    if use_yolo_context:
+        try:
+            img = cv2.imread(str(image_path))
+            if img is not None:
+                detection = yolo_detect_subject(img, debug=False)
+                if detection:
+                    x, y, w, h, class_name, conf = detection
+                    img_h, img_w = img.shape[:2]
+                    center_x = (x + w / 2) / img_w
+                    center_y = (y + h / 2) / img_h
+                    size_ratio = (w * h) / (img_w * img_h)
+                    h_pos = "left" if center_x < 0.33 else "right" if center_x > 0.66 else "center"
+                    v_pos = "top" if center_y < 0.33 else "bottom" if center_y > 0.66 else "middle"
+                    position = (
+                        f"{v_pos}-{h_pos}" if v_pos != "middle" or h_pos != "center" else "centered"
+                    )
+                    size_desc = (
+                        "large" if size_ratio > 0.3 else "medium" if size_ratio > 0.1 else "small"
+                    )
+                    yolo_context = (
+                        f"\n\n**Detected Subject**: {class_name} "
+                        f"({position}, {size_desc}, confidence: {conf:.0%})"
+                    )
+        except Exception:
+            pass
+
+    image_data = _encode_image_for_ollama(
+        image_path,
+        max_edge=max_image_edge,
+        jpeg_quality=jpeg_quality,
+    )
+
+    enhanced_prompt = prompt or build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
+    if yolo_context:
+        enhanced_prompt = enhanced_prompt + yolo_context
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "format": "json",
+        "keep_alive": keep_alive,
+        "options": {"temperature": 0, "num_predict": 220},
+        "messages": [{"role": "user", "content": enhanced_prompt, "images": [image_data]}],
+    }
+
+    endpoint = f"{base_url.rstrip('/')}/api/chat"
+    request = Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8")
+    except HTTPError as error:
+        details = ""
+        try:
+            details = error.read().decode("utf-8", errors="ignore")
+        except Exception:
+            details = ""
+        raise RuntimeError(f"Ollama request failed ({error.code}) at {endpoint}: {details[:300]}") from error
+    except URLError as error:
+        raise RuntimeError(f"Ollama connection failed for {endpoint}: {error}") from error
+
+    parsed = json.loads(body)
+    message = parsed.get("message") if isinstance(parsed, dict) else None
+    content = (message or {}).get("content", "") if isinstance(message, dict) else ""
+    if not content:
+        raise RuntimeError(f"Ollama response did not include message content: {body[:300]}")
+    return json.loads(_extract_json_payload(content))
+
+
+def _is_retryable_ollama_error(error: Exception) -> bool:
+    text = str(error).lower()
+    retryable_markers = [
+        "timed out",
+        "timeout",
+        "connection failed",
+        "connection reset",
+        "temporarily unavailable",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(marker in text for marker in retryable_markers)
 
 
 def _claude_setup_hint(error: Exception) -> str:
@@ -1001,6 +1270,16 @@ def _claude_setup_hint(error: Exception) -> str:
     return (
         "Claude initialization failed. Verify dependency and API key setup.\n"
         'Run: python -c "import anthropic; print(anthropic.__version__)".'
+    )
+
+
+def _ollama_setup_hint(error: Exception) -> str:
+    """Return a practical setup hint for common Ollama initialization failures."""
+    return (
+        "Ollama setup failed. Verify PICKINSTA_OLLAMA_BASE_URL points to a running Ollama server,\n"
+        "and that PICKINSTA_OLLAMA_MODEL is already pulled on that server (for example: qwen2.5vl:7b).\n"
+        "You can increase client timeout with PICKINSTA_OLLAMA_TIMEOUT_SEC.\n"
+        f"Original error: {error}"
     )
 
 
@@ -1043,6 +1322,17 @@ def batch_vision_score(
     claude_api_key = None
     claude_client = None
     claude_model_used = None
+    ollama_model_used = None
+    ollama_base_url = None
+    ollama_timeout_seconds = resolve_ollama_timeout_seconds()
+    ollama_max_image_edge = resolve_ollama_max_image_edge()
+    ollama_jpeg_quality = resolve_ollama_jpeg_quality()
+    ollama_keep_alive = "10m"
+    ollama_use_yolo_context = resolve_ollama_use_yolo_context()
+    ollama_concurrency = resolve_ollama_concurrency()
+    ollama_max_retries = resolve_ollama_max_retries()
+    ollama_retry_backoff = resolve_ollama_retry_backoff_seconds()
+    ollama_circuit_breaker_errors = resolve_ollama_circuit_breaker_errors()
     claude_base_prompt = build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
     claude_prompt_hash = claude_prompt_sha256(claude_base_prompt)
     claude_cache_hits = 0
@@ -1106,6 +1396,159 @@ def batch_vision_score(
                 item.one_line = "Claude unavailable — ranked by technical score only"
             candidates.sort(key=lambda x: x.final_score, reverse=True)
             return candidates
+    elif scorer == "ollama":
+        try:
+            ollama_base_url = resolve_ollama_base_url(search_dir=env_search_dir)
+            ollama_model_used = resolve_ollama_model(search_dir=env_search_dir)
+            ollama_keep_alive = resolve_ollama_keep_alive(search_dir=env_search_dir)
+            request = Request(
+                f"{ollama_base_url.rstrip('/')}/api/tags",
+                headers={"Accept": "application/json"},
+                method="GET",
+            )
+            with urlopen(request, timeout=min(60, ollama_timeout_seconds)):
+                pass
+
+            account_context = resolve_account_context(search_dir=env_search_dir)
+            claude_base_prompt = build_vision_prompt(account_context)
+            claude_prompt_hash = claude_prompt_sha256(claude_base_prompt)
+        except Exception as e:
+            print(f"  ⚠ Ollama unavailable: {e}")
+            print(f"  💡 {_ollama_setup_hint(e)}")
+            print("  ↪ Falling back to technical-only ranking for this run.")
+            for item in candidates:
+                item.final_score = item.technical.get("composite", 0.0)
+                item.one_line = "Ollama unavailable — ranked by technical score only"
+            candidates.sort(key=lambda x: x.final_score, reverse=True)
+            return candidates
+
+    if scorer == "ollama":
+        progress_write = print
+        progress_bar = None
+        try:
+            from tqdm.auto import tqdm
+
+            progress_bar = tqdm(
+                total=len(candidates),
+                desc="  Ollama scoring",
+                unit="img",
+            )
+            progress_write = tqdm.write
+        except Exception as e:
+            print(f"  ⚠ Progress bar unavailable: {e}")
+
+        def finalize_item(item: ImageScore, vision: dict) -> None:
+            vision_normalized = vision.get("total", 30) / 60.0
+            base_score = item.technical["composite"] * 0.3 + vision_normalized * 0.7
+            gate = _claude_crop_gate_multiplier(vision)
+            item.vision = vision
+            item.final_score = base_score * gate
+            item.one_line = vision.get("one_line", "")
+
+        def mark_failed(item: ImageScore, message: str) -> None:
+            item.final_score = item.technical["composite"] * 0.3
+            item.one_line = message
+
+        def score_one_with_retry(item: ImageScore) -> dict:
+            last_error = None
+            for attempt in range(ollama_max_retries + 1):
+                try:
+                    return score_with_ollama(
+                        item.path,
+                        base_url=ollama_base_url or DEFAULT_OLLAMA_BASE_URL,
+                        model=ollama_model_used or DEFAULT_OLLAMA_MODEL,
+                        use_yolo_context=ollama_use_yolo_context,
+                        prompt=claude_base_prompt,
+                        timeout_seconds=ollama_timeout_seconds,
+                        max_image_edge=ollama_max_image_edge,
+                        jpeg_quality=ollama_jpeg_quality,
+                        keep_alive=ollama_keep_alive,
+                    )
+                except Exception as e:
+                    last_error = e
+                    if attempt >= ollama_max_retries or not _is_retryable_ollama_error(e):
+                        break
+                    sleep_seconds = ollama_retry_backoff * (2**attempt)
+                    time.sleep(sleep_seconds)
+            raise RuntimeError(
+                f"Ollama scoring failed after {ollama_max_retries + 1} attempt(s): {last_error}"
+            ) from last_error
+
+        scored = 0
+        failed = 0
+        consecutive_failures = 0
+        stop_submissions = False
+        next_index = 0
+        total_items = len(candidates)
+        pending: dict = {}
+
+        with ThreadPoolExecutor(max_workers=ollama_concurrency) as executor:
+            while next_index < total_items and len(pending) < ollama_concurrency:
+                future = executor.submit(score_one_with_retry, candidates[next_index])
+                pending[future] = next_index
+                next_index += 1
+
+            while pending:
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = pending.pop(future)
+                    item = candidates[idx]
+                    try:
+                        vision = future.result()
+                        finalize_item(item, vision)
+                        scored += 1
+                        consecutive_failures = 0
+                    except Exception as e:
+                        progress_write(f"  ⚠ Vision score failed for {item.path.name}: {e}")
+                        mark_failed(item, "Vision scoring failed — ranked by technical score only")
+                        failed += 1
+                        consecutive_failures += 1
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+
+                while (
+                    not stop_submissions
+                    and next_index < total_items
+                    and len(pending) < ollama_concurrency
+                ):
+                    if consecutive_failures >= ollama_circuit_breaker_errors:
+                        stop_submissions = True
+                        progress_write(
+                            "  ⚠ Ollama circuit breaker opened due to consecutive failures; "
+                            "remaining images will use technical-only fallback."
+                        )
+                        break
+                    future = executor.submit(score_one_with_retry, candidates[next_index])
+                    pending[future] = next_index
+                    next_index += 1
+
+        if stop_submissions and next_index < total_items:
+            remaining = candidates[next_index:]
+            for item in remaining:
+                mark_failed(item, "Ollama circuit breaker active — ranked by technical score only")
+            failed += len(remaining)
+            if progress_bar is not None:
+                progress_bar.update(len(remaining))
+
+        if progress_bar is not None:
+            progress_bar.close()
+
+        yolo_label = "on" if ollama_use_yolo_context else "off"
+        print(f"  🖥️  Ollama server: {ollama_base_url} | model: {ollama_model_used}")
+        print(
+            "  ⚙️  Ollama tuning: "
+            f"timeout={ollama_timeout_seconds}s, max_edge={ollama_max_image_edge}px, "
+            f"jpeg_quality={ollama_jpeg_quality}, keep_alive={ollama_keep_alive}, yolo={yolo_label}"
+        )
+        print(
+            "  🔁 Ollama resilience: "
+            f"concurrency={ollama_concurrency}, retries={ollama_max_retries}, "
+            f"retry_backoff={ollama_retry_backoff:.2f}s, "
+            f"circuit_breaker_errors={ollama_circuit_breaker_errors}"
+        )
+        candidates.sort(key=lambda x: x.final_score, reverse=True)
+        print(f"  ✅ Vision scoring: {scored} scored, {failed} failed")
+        return candidates
 
     scored = 0
     failed = 0
@@ -1119,7 +1562,7 @@ def batch_vision_score(
             score_iter = tqdm(
                 candidates,
                 total=len(candidates),
-                desc="  Claude scoring",
+                desc=f"  {scorer.capitalize()} scoring",
                 unit="img",
             )
             progress_write = tqdm.write
@@ -2283,7 +2726,7 @@ def run_pipeline(
         input_folder: Path to folder with raw event photos
         output_folder: Path for final 1080x1440 output images
         top_n: Number of top images to output
-        scorer: "clip" (free/local) or "claude" (best quality, API costs)
+        scorer: "clip" (free/local), "claude" (best quality, API costs), or "ollama" (self-hosted)
         vision_candidates_pct: Send top N% of technically-scored images to vision scoring
         score_all: If True, send all technically-scored images to vision scoring
         claude_crop_first: If True with Claude scorer, pre-crop candidates before scoring
@@ -2349,7 +2792,7 @@ def run_pipeline(
     # Also save a JSON report
     report = []
 
-    if scorer == "claude":
+    if scorer in {"claude", "ollama"}:
         crop_safe = [
             item
             for item in ranked
@@ -2488,9 +2931,9 @@ Examples:
     parser.add_argument(
         "--scorer",
         "-s",
-        choices=["clip", "claude"],
+        choices=["clip", "claude", "ollama"],
         default="clip",
-        help="Vision scorer: 'clip' (free/local) or 'claude' (API, best quality)",
+        help="Vision scorer: 'clip' (free/local), 'claude' (API), or 'ollama' (self-hosted)",
     )
     parser.add_argument(
         "--vision-pct",
