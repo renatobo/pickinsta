@@ -83,7 +83,7 @@ If `ultralytics` is not installed, YOLO is disabled and smart crop falls back to
 ## Optional manual dependency install
 
 ```bash
-pip install Pillow opencv-python numpy imagehash
+pip install Pillow opencv-python-headless numpy imagehash
 pip install transformers torch
 pip install anthropic tqdm
 pip install ultralytics

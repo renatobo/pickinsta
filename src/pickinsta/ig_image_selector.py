@@ -18,7 +18,7 @@ Usage:
   python -m pickinsta ./input --output ./selected --scorer claude    # best quality, ~$0.50/100 imgs
 
 Requirements:
-  pip install Pillow opencv-python numpy imagehash
+  pip install Pillow opencv-python-headless numpy imagehash
 
   For CLIP scoring (free, local):
     pip install transformers torch
@@ -34,6 +34,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -1126,6 +1127,147 @@ def _extract_json_payload(raw_text: str) -> str:
     return raw
 
 
+def _parse_ollama_message_json(body: str, parsed: dict) -> dict:
+    """Parse JSON model output from Ollama chat `message.content` or `message.thinking`."""
+    message = parsed.get("message") if isinstance(parsed, dict) else None
+    if not isinstance(message, dict):
+        raise RuntimeError(f"Ollama response did not include message object: {body[:300]}")
+
+    content = str(message.get("content") or "").strip()
+    thinking = str(message.get("thinking") or "").strip()
+    for text in (content, thinking):
+        if not text:
+            continue
+        try:
+            return json.loads(_extract_json_payload(text))
+        except Exception:
+            continue
+
+    for text in (content, thinking):
+        fallback = _parse_ollama_plaintext_scores(text)
+        if fallback is not None:
+            return fallback
+
+    for text in (content, thinking):
+        fallback = _ollama_neutral_fallback_from_text(text)
+        if fallback is not None:
+            return fallback
+
+    raise RuntimeError(
+        "Ollama response did not include parseable JSON in message content/thinking: "
+        f"{body[:300]}"
+    )
+
+
+def _parse_ollama_plaintext_scores(raw_text: str) -> Optional[dict]:
+    """Fallback parser for rubric-like plain text when model ignores JSON format."""
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+
+    key_patterns = {
+        "subject_clarity": r"subject[\s_-]*clarity",
+        "lighting": r"lighting",
+        "color_pop": r"color[\s_-]*pop",
+        "emotion": r"emotion",
+        "scroll_stop": r"scroll[\s_-]*stop",
+        "crop_4x5": r"crop[\s_-]*4x5",
+    }
+
+    def _extract_score(label_pattern: str) -> Optional[float]:
+        patterns = [
+            rf"(?is){label_pattern}\s*[:=-]\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*10",
+            rf"(?is){label_pattern}[^0-9]{{0,48}}([0-9]+(?:\.[0-9]+)?)\s*/\s*10",
+            rf"(?is){label_pattern}\s*[:=-]\s*([0-9]+(?:\.[0-9]+)?)",
+            rf"(?is){label_pattern}[^0-9]{{0,48}}([0-9]+(?:\.[0-9]+)?)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return float(match.group(1))
+                except Exception:
+                    continue
+        return None
+
+    scores: dict[str, int] = {}
+    for key, label_pattern in key_patterns.items():
+        score = _extract_score(label_pattern)
+        if score is None:
+            continue
+        scores[key] = int(max(0, min(10, round(score))))
+
+    if len(scores) < 3:
+        return None
+
+    present_values = list(scores.values())
+    fill_value = int(round(sum(present_values) / len(present_values))) if present_values else 5
+    fill_value = max(0, min(10, fill_value))
+    for key in key_patterns:
+        scores.setdefault(key, fill_value)
+
+    total_match = re.search(r"(?is)\btotal\s*[:=-]?\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if total_match:
+        total = int(max(0, min(60, round(float(total_match.group(1))))))
+    else:
+        total = sum(scores[k] for k in key_patterns)
+
+    one_line = ""
+    one_line_match = re.search(r"(?is)\bone[\s_-]*line\s*[:=-]\s*(.+)", text)
+    if one_line_match:
+        one_line = one_line_match.group(1).strip().splitlines()[0]
+    if not one_line:
+        first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+        one_line = first_sentence[:180] if first_sentence else "Vision scoring summary"
+
+    return {
+        "subject_clarity": scores["subject_clarity"],
+        "lighting": scores["lighting"],
+        "color_pop": scores["color_pop"],
+        "emotion": scores["emotion"],
+        "scroll_stop": scores["scroll_stop"],
+        "crop_4x5": scores["crop_4x5"],
+        "total": total,
+        "one_line": one_line,
+    }
+
+
+def _ollama_neutral_fallback_from_text(raw_text: str) -> Optional[dict]:
+    """Last-resort fallback when model returns prose without structured numeric output."""
+    text = (raw_text or "").strip()
+    if not text:
+        return None
+
+    values: list[float] = []
+    for match in re.finditer(r"(?is)\b([0-9]+(?:\.[0-9]+)?)\s*/\s*10\b", text):
+        try:
+            values.append(float(match.group(1)))
+        except Exception:
+            continue
+    if values:
+        values.sort()
+        mid = len(values) // 2
+        base = values[mid] if len(values) % 2 == 1 else (values[mid - 1] + values[mid]) / 2.0
+        score = int(max(0, min(10, round(base))))
+    else:
+        score = 5
+
+    first_sentence = re.split(r"(?<=[.!?])\s+", text, maxsplit=1)[0].strip()
+    one_line = first_sentence[:180] if first_sentence else "Vision response prose; neutral fallback"
+    total = int(max(0, min(60, score * 6)))
+
+    return {
+        "subject_clarity": score,
+        "lighting": score,
+        "color_pop": score,
+        "emotion": score,
+        "scroll_stop": score,
+        "crop_4x5": score,
+        "total": total,
+        "one_line": one_line,
+    }
+
+
 def _encode_image_for_ollama(
     image_path: Path,
     *,
@@ -1202,6 +1344,7 @@ def score_with_ollama(
     payload = {
         "model": model,
         "stream": False,
+        "think": False,
         "format": "json",
         "keep_alive": keep_alive,
         "options": {"temperature": 0, "num_predict": 220},
@@ -1229,11 +1372,7 @@ def score_with_ollama(
         raise RuntimeError(f"Ollama connection failed for {endpoint}: {error}") from error
 
     parsed = json.loads(body)
-    message = parsed.get("message") if isinstance(parsed, dict) else None
-    content = (message or {}).get("content", "") if isinstance(message, dict) else ""
-    if not content:
-        raise RuntimeError(f"Ollama response did not include message content: {body[:300]}")
-    return json.loads(_extract_json_payload(content))
+    return _parse_ollama_message_json(body, parsed)
 
 
 def _is_retryable_ollama_error(error: Exception) -> bool:

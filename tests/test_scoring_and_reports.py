@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 import types
@@ -310,3 +311,167 @@ def test_batch_vision_score_ollama_retries_and_succeeds(tmp_path, monkeypatch) -
     expected = (0.4 * 0.3 + (42 / 60.0) * 0.7) * 1.0
     assert ranked[0].final_score == expected
     assert ranked[0].one_line == "Recovered after retry"
+
+
+def test_score_with_ollama_parses_json_from_thinking_when_content_is_empty(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "thinking.jpg"
+    image_file.write_bytes(b"fake-image")
+    monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            payload = {
+                "model": "qwen3-vl:8b",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": '{"total": 47, "crop_4x5": 9, "one_line": "Strong action frame"}',
+                },
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    result = selector.score_with_ollama(
+        image_path=image_file,
+        base_url="http://127.0.0.1:11434",
+        model="qwen3-vl:8b",
+        use_yolo_context=False,
+    )
+
+    assert result["total"] == 47
+    assert result["crop_4x5"] == 9
+    assert "Strong action frame" in result["one_line"]
+
+
+def test_score_with_ollama_sets_think_false_in_payload(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "payload.jpg"
+    image_file.write_bytes(b"fake-image")
+    monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
+    observed = {"think": None}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            payload = {"message": {"role": "assistant", "content": '{"total": 40, "crop_4x5": 8}'}}
+            return json.dumps(payload).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        observed_payload = json.loads(request.data.decode("utf-8"))
+        observed["think"] = observed_payload.get("think")
+        return FakeResponse()
+
+    monkeypatch.setattr(selector, "urlopen", fake_urlopen)
+
+    selector.score_with_ollama(
+        image_path=image_file,
+        base_url="http://127.0.0.1:11434",
+        model="qwen3-vl:8b",
+        use_yolo_context=False,
+    )
+
+    assert observed["think"] is False
+
+
+def test_score_with_ollama_parses_plaintext_thinking_rubric(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "thinking-plain.jpg"
+    image_file.write_bytes(b"fake-image")
+    monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            payload = {
+                "model": "qwen3-vl:8b",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": (
+                        "1. SUBJECT_CLARITY: strong separation, score 8/10\n"
+                        "2. LIGHTING: balanced highlights 7/10\n"
+                        "3. COLOR_POP: vibrant reds and blues 8/10\n"
+                        "4. EMOTION: dynamic lean angle 7/10\n"
+                        "5. SCROLL_STOP: eye-catching action 8/10\n"
+                        "6. CROP_4x5: good portrait crop viability 9/10\n"
+                        "TOTAL: 47\n"
+                    ),
+                },
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    result = selector.score_with_ollama(
+        image_path=image_file,
+        base_url="http://127.0.0.1:11434",
+        model="qwen3-vl:8b",
+        use_yolo_context=False,
+    )
+
+    assert result["subject_clarity"] == 8
+    assert result["lighting"] == 7
+    assert result["color_pop"] == 8
+    assert result["emotion"] == 7
+    assert result["scroll_stop"] == 8
+    assert result["crop_4x5"] == 9
+    assert result["total"] == 47
+
+
+def test_score_with_ollama_uses_neutral_fallback_for_prose_only_thinking(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "thinking-prose.jpg"
+    image_file.write_bytes(b"fake-image")
+    monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            payload = {
+                "model": "qwen3-vl:8b",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": (
+                        "Got it, let's break down each criterion for this motorcycle photo. "
+                        "The rider is a clear focal point and the background is not too distracting."
+                    ),
+                },
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    result = selector.score_with_ollama(
+        image_path=image_file,
+        base_url="http://127.0.0.1:11434",
+        model="qwen3-vl:8b",
+        use_yolo_context=False,
+    )
+
+    assert result["subject_clarity"] == 5
+    assert result["lighting"] == 5
+    assert result["color_pop"] == 5
+    assert result["emotion"] == 5
+    assert result["scroll_stop"] == 5
+    assert result["crop_4x5"] == 5
+    assert result["total"] == 30
