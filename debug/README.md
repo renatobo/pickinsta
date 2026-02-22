@@ -10,7 +10,7 @@ specific pipeline step.
 
 ### `debug_yolo_claude.py`
 - Purpose: inspect how YOLO detections are turned into extra context appended
-  to the Claude vision prompt.
+  to the shared Claude/Ollama vision prompt.
 - What it does:
   - loads one hardcoded image from `input/`
   - runs `yolo_detect_subject(...)`

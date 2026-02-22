@@ -85,6 +85,88 @@ def test_resolve_claude_model_precedence(monkeypatch) -> None:
     assert selector.resolve_claude_model() == "legacy-env-model"
 
 
+def test_resolve_ollama_settings_from_env_and_defaults(monkeypatch, tmp_path) -> None:
+    isolated_cwd = tmp_path / "cwd"
+    isolated_cwd.mkdir()
+    monkeypatch.chdir(isolated_cwd)
+    monkeypatch.delenv(selector.PICKINSTA_OLLAMA_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.PICKINSTA_OLLAMA_MODEL_ENV_VAR, raising=False)
+    assert selector.resolve_ollama_base_url() == selector.DEFAULT_OLLAMA_BASE_URL
+    assert selector.resolve_ollama_model() == selector.DEFAULT_OLLAMA_MODEL
+
+    monkeypatch.setenv(selector.PICKINSTA_OLLAMA_BASE_URL_ENV_VAR, "http://10.0.0.20:11434")
+    monkeypatch.setenv(selector.PICKINSTA_OLLAMA_MODEL_ENV_VAR, "qwen2.5vl:7b")
+    assert selector.resolve_ollama_base_url() == "http://10.0.0.20:11434"
+    assert selector.resolve_ollama_model() == "qwen2.5vl:7b"
+
+
+def test_resolve_ollama_settings_from_env_file(monkeypatch, tmp_path) -> None:
+    isolated_cwd = tmp_path / "cwd"
+    isolated_cwd.mkdir()
+    monkeypatch.chdir(isolated_cwd)
+    monkeypatch.delenv(selector.PICKINSTA_OLLAMA_BASE_URL_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.PICKINSTA_OLLAMA_MODEL_ENV_VAR, raising=False)
+    env_dir = tmp_path / "envdir"
+    env_dir.mkdir()
+    (env_dir / ".env").write_text(
+        "\n".join(
+            [
+                "PICKINSTA_OLLAMA_BASE_URL=http://remote-host:11434",
+                "PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert selector.resolve_ollama_base_url(search_dir=env_dir) == "http://remote-host:11434"
+    assert selector.resolve_ollama_model(search_dir=env_dir) == "qwen2.5vl:7b"
+
+
+def test_resolve_ollama_tuning_env(monkeypatch, tmp_path) -> None:
+    isolated_cwd = tmp_path / "cwd"
+    isolated_cwd.mkdir()
+    monkeypatch.chdir(isolated_cwd)
+    monkeypatch.delenv(selector.OLLAMA_TIMEOUT_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_MAX_EDGE_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_JPEG_QUALITY_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_KEEP_ALIVE_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_USE_YOLO_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_CONCURRENCY_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_MAX_RETRIES_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_BACKOFF_BASE_ENV_VAR, raising=False)
+    monkeypatch.delenv(selector.OLLAMA_CIRCUIT_BREAKER_ENV_VAR, raising=False)
+
+    assert selector.resolve_ollama_timeout_seconds() == 300
+    assert selector.resolve_ollama_max_image_edge() == 1024
+    assert selector.resolve_ollama_jpeg_quality() == 80
+    assert selector.resolve_ollama_keep_alive() == "10m"
+    assert selector.resolve_ollama_use_yolo_context() is False
+    assert selector.resolve_ollama_concurrency() == 2
+    assert selector.resolve_ollama_max_retries() == 2
+    assert selector.resolve_ollama_retry_backoff_seconds() == 0.75
+    assert selector.resolve_ollama_circuit_breaker_errors() == 6
+
+    monkeypatch.setenv(selector.OLLAMA_TIMEOUT_ENV_VAR, "450")
+    monkeypatch.setenv(selector.OLLAMA_MAX_EDGE_ENV_VAR, "768")
+    monkeypatch.setenv(selector.OLLAMA_JPEG_QUALITY_ENV_VAR, "70")
+    monkeypatch.setenv(selector.OLLAMA_KEEP_ALIVE_ENV_VAR, "20m")
+    monkeypatch.setenv(selector.OLLAMA_USE_YOLO_ENV_VAR, "true")
+    monkeypatch.setenv(selector.OLLAMA_CONCURRENCY_ENV_VAR, "4")
+    monkeypatch.setenv(selector.OLLAMA_MAX_RETRIES_ENV_VAR, "3")
+    monkeypatch.setenv(selector.OLLAMA_BACKOFF_BASE_ENV_VAR, "0.5")
+    monkeypatch.setenv(selector.OLLAMA_CIRCUIT_BREAKER_ENV_VAR, "8")
+
+    assert selector.resolve_ollama_timeout_seconds() == 450
+    assert selector.resolve_ollama_max_image_edge() == 768
+    assert selector.resolve_ollama_jpeg_quality() == 70
+    assert selector.resolve_ollama_keep_alive() == "20m"
+    assert selector.resolve_ollama_use_yolo_context() is True
+    assert selector.resolve_ollama_concurrency() == 4
+    assert selector.resolve_ollama_max_retries() == 3
+    assert selector.resolve_ollama_retry_backoff_seconds() == 0.5
+    assert selector.resolve_ollama_circuit_breaker_errors() == 8
+
+
 def test_claude_model_candidates_include_alias_and_fallbacks() -> None:
     models = selector._claude_model_candidates("claude-sonnet-4-5-20250514")
     assert models[0] == "claude-sonnet-4-5-20250514"

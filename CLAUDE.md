@@ -15,7 +15,7 @@ The core pipeline in `src/pickinsta/ig_image_selector.py` processes images throu
 1. **Stage 0 - Resize**: Resize to max 1920px (saves compute, preserves EXIF orientation)
 2. **Stage 1 - Deduplicate**: Perceptual hashing (imagehash) removes near-duplicates
 3. **Stage 2 - Technical Scoring**: OpenCV-based quality metrics (sharpness, lighting, composition, color harmony)
-4. **Stage 3 - Vision Scoring**: CLIP (local/free) or Claude API (best quality) for aesthetic evaluation
+4. **Stage 3 - Vision Scoring**: CLIP (local/free), Claude API, or self-hosted Ollama for aesthetic evaluation
 5. **Stage 4 - Smart Crop**: YOLO-guided crop to 1080x1440 following composition rules
 
 ### Key Design Decisions
@@ -23,17 +23,18 @@ The core pipeline in `src/pickinsta/ig_image_selector.py` processes images throu
 **YOLO Integration (Recent Enhancement)**:
 - YOLOv8 detects subjects (motorcycles, people, vehicles) before cropping
 - Ensures crops keep the full subject in frame (previously used unreliable saliency detection)
-- YOLO context is passed to Claude to improve scoring accuracy
+- YOLO context is passed to Claude and Ollama to improve scoring accuracy
 - Graceful fallback to saliency detection if YOLO finds nothing
 - See `debug/README.md` and `debug/debug_yolo_claude.py` for debugging details
 
-**Dual Scorer Architecture**:
+**Three-Scorer Architecture**:
 - **CLIP** (`--scorer clip`): Free, local, zero-shot classification. Uses 4 positive + 2 negative prompts. Maps logits to 0-60 scale to match Claude's range.
 - **Claude** (`--scorer claude`): Best quality, API costs ~$0.50/100 images. Scores 6 criteria (subject_clarity, lighting, color_pop, emotion, scroll_stop, crop_4x5). Returns JSON with scores + one-line summary.
+- **Ollama** (`--scorer ollama`): Self-hosted vision scoring with the same 0-60 rubric. Supports retry/backoff, circuit breaker, and configurable request concurrency.
 
 **Final Score Calculation**: `final_score = 0.3 * technical_composite + 0.7 * vision_normalized`
 
-**Caching Strategy**: Claude responses cached per original source file as `<filename>.pickinsta.json`. Cache includes image SHA256 + model + prompt hash for validity checking.
+**Caching Strategy**: Claude responses are cached per original source file as `<filename>.pickinsta.json`. Cache includes image SHA256 + model + prompt hash for validity checking.
 
 ### Composition Rules Implementation
 
@@ -84,6 +85,9 @@ pickinsta ./input --output ./selected --scorer claude --all --claude-crop-first
 
 # As module / override model
 python -m pickinsta ./input --scorer claude --claude-model claude-sonnet-4-6
+
+# Ollama scorer (self-hosted), score all candidates
+pickinsta ./input --output ./selected --scorer ollama --all
 ```
 
 ### Environment Setup
@@ -97,8 +101,15 @@ cp .env.example .env
 Key variables:
 - `ANTHROPIC_API_KEY` — required for Claude scorer
 - `ANTHROPIC_MODEL` — override default model (default: `claude-sonnet-4-6`)
+- `CLAUDE_MODEL` — alias fallback for Claude model resolution
 - `HF_TOKEN` — reduces HuggingFace rate limit warnings (CLIP)
-- `PICKINSTA_ACCOUNT_CONTEXT` — custom account context injected into Claude prompts
+- `PICKINSTA_ACCOUNT_CONTEXT` — custom account context injected into Claude/Ollama prompts
+- `PICKINSTA_OLLAMA_BASE_URL` — Ollama endpoint (default: `http://127.0.0.1:11434`)
+- `PICKINSTA_OLLAMA_MODEL` — Ollama model tag (default: `qwen2.5vl:7b`)
+- `PICKINSTA_OLLAMA_CONCURRENCY` — parallel requests submitted by pickinsta (default: `2`, min `1`, max `16`)
+- `PICKINSTA_OLLAMA_MAX_RETRIES` — retries for transient failures (default: `2`)
+- `PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC` — exponential backoff base seconds (default: `0.75`)
+- `PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS` — consecutive failure threshold before fallback (default: `6`)
 - `PICKINSTA_YOLO_MODEL` — override YOLO model path (default: `~/.cache/pickinsta/models/yolov8n.pt`)
 
 ### Testing
@@ -119,7 +130,7 @@ Debug mode creates visualizations showing:
 
 ## Important File Locations
 
-- **Main pipeline**: `src/pickinsta/ig_image_selector.py` (~2,500 lines, all 5 stages + CLI)
+- **Main pipeline**: `src/pickinsta/ig_image_selector.py` (~3,100 lines, all 5 stages + CLI)
 - **CLIP scorer**: `src/pickinsta/clip_scorer.py` (separate module, loaded lazily on `--scorer clip`)
 - **Config**: `pyproject.toml` (defines `pickinsta` console script, optional dependencies, ruff config)
 - **Docs**: `docs/composition-rules.md` (technical scoring weights, cropping heuristics)
@@ -134,7 +145,7 @@ Debug mode creates visualizations showing:
 
 ### Changing Claude Scoring Criteria
 
-1. Edit `VISION_PROMPT` constant in `ig_image_selector.py`
+1. Edit `VISION_PROMPT_TEMPLATE` / `build_vision_prompt(...)` in `ig_image_selector.py`
 2. Update prompt hash will invalidate caches (intentional for consistency)
 3. Ensure Claude returns JSON with expected keys: `subject_clarity`, `lighting`, `color_pop`, `emotion`, `scroll_stop`, `crop_4x5`, `total`, `one_line`
 
@@ -152,7 +163,9 @@ Add extension to `SUPPORTED_EXTENSIONS` set (line 53). Ensure PIL can open the f
 
 **CLIP model download fails**: First run requires internet to download ~1.7GB model from HuggingFace. Set `HF_TOKEN` in environment to avoid rate limits.
 
-**Claude model not found**: Use `--claude-model` flag or set `ANTHROPIC_MODEL` in .env. Pipeline tries fallback models: preferred → undated alias → `claude-sonnet-4-5` → `claude-3-5-sonnet-latest`.
+**Claude model not found**: Use `--claude-model` flag or set `ANTHROPIC_MODEL`/`CLAUDE_MODEL` in `.env`. Pipeline tries fallback models: preferred → undated alias → `claude-sonnet-4-6` → `claude-3-5-sonnet-latest`.
+
+**Ollama scoring fails/unavailable**: Verify `PICKINSTA_OLLAMA_BASE_URL` and `PICKINSTA_OLLAMA_MODEL`, then test with `curl <base_url>/api/tags`. Tune server (`OLLAMA_NUM_PARALLEL`, `OLLAMA_NUM_THREAD`) and client (`PICKINSTA_OLLAMA_CONCURRENCY`) together.
 
 **YOLO not available**: Optional dependency. Install with `pip install -e '.[yolo]'`. Pipeline falls back to saliency detection automatically.
 

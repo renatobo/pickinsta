@@ -1,5 +1,23 @@
 # Troubleshooting
 
+## OpenCV on Linux servers
+
+If startup fails with `ImportError: libGL.so.1: cannot open shared object file`:
+
+- Prefer headless OpenCV in server environments:
+
+```bash
+python -m pip uninstall -y opencv-python opencv-python-headless
+python -m pip install -U opencv-python-headless
+```
+
+- Or install missing OS libs if you must use GUI OpenCV:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1 libglib2.0-0
+```
+
 ## CLIP
 
 If CLIP fails during model load:
@@ -38,6 +56,51 @@ Or set in env/.env:
 
 ```bash
 ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
+## Ollama
+
+If Ollama scoring fails to connect:
+
+```bash
+curl "${PICKINSTA_OLLAMA_BASE_URL:-http://127.0.0.1:11434}/api/tags"
+```
+
+Check required env values:
+
+```bash
+PICKINSTA_OLLAMA_BASE_URL=http://YOUR_SERVER_IP:11434
+PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b
+```
+
+If scoring is slow, tune both client and server concurrency:
+
+```bash
+export PICKINSTA_OLLAMA_CONCURRENCY=4
+```
+
+Linux systemd override example:
+
+```ini
+[Service]
+Environment="OLLAMA_NUM_PARALLEL=4"
+Environment="OLLAMA_NUM_THREAD=3"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+```
+
+Then reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+If CPU appears capped near 50%, check cgroup limits:
+
+```bash
+sudo systemctl show ollama -p CPUQuota -p AllowedCPUs
+cat /sys/fs/cgroup/cpu/system.slice/ollama.service/cpu.cfs_quota_us
+cat /sys/fs/cgroup/cpu/system.slice/ollama.service/cpu.cfs_period_us
 ```
 
 ## CLI usage/help

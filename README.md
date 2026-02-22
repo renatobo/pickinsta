@@ -22,6 +22,7 @@ Project docs are in `/Users/renatobo/development/pickinsta/docs`:
 - `docs/README.md` (documentation index)
 - `docs/composition-rules.md` (composition/scoring/cropping reference)
 - `docs/troubleshooting.md` (setup and runtime troubleshooting)
+- `docs/ollama-server-setup.md` (self-hosted Ollama setup for macOS/Linux)
 
 ## Pipeline workflow
 
@@ -44,10 +45,12 @@ flowchart TD
     J -->|yes| K["Use cached Claude score"]
     J -->|no| L["Claude vision scoring<br/>Optional YOLO context for subject info"]
     L --> M["Save cache entry"]
+    F -->|ollama| Q["Resolve Ollama base URL + model<br/>Optional YOLO context"]
 
     G --> N["Final score<br/>0.3 * technical + 0.7 * vision"]
     K --> N
     M --> N
+    Q --> N
 
     N --> O["Stage 4: Smart crop<br/>YOLO-guided crop to 1080x1440<br/>Fallback: saliency/center"]
     O --> P["Output top N images + reports<br/>selection_report.json and selection_report.md<br/>Optional *_full_* fallback only for uncertain crops"]
@@ -82,13 +85,13 @@ If `ultralytics` is not installed, YOLO is disabled and smart crop falls back to
 ## Optional manual dependency install
 
 ```bash
-pip install Pillow opencv-python numpy imagehash
+pip install Pillow opencv-python-headless numpy imagehash
 pip install transformers torch
 pip install anthropic tqdm
 pip install ultralytics
 ```
 
-## .env setup (Claude + optional HF token)
+## .env setup (Claude/Ollama + optional HF token)
 
 Create a `.env` file with your key:
 
@@ -109,6 +112,19 @@ Optional content:
 HF_TOKEN=hf_xxx_your_token
 # optional Claude model override:
 ANTHROPIC_MODEL=claude-sonnet-4-6
+# optional Ollama remote server + model:
+PICKINSTA_OLLAMA_BASE_URL=http://remote-machine-or-ip:11434
+PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b
+# optional Ollama speed/stability tuning:
+PICKINSTA_OLLAMA_TIMEOUT_SEC=300
+PICKINSTA_OLLAMA_MAX_IMAGE_EDGE=1024
+PICKINSTA_OLLAMA_JPEG_QUALITY=80
+PICKINSTA_OLLAMA_KEEP_ALIVE=10m
+PICKINSTA_OLLAMA_USE_YOLO_CONTEXT=false
+PICKINSTA_OLLAMA_CONCURRENCY=2
+PICKINSTA_OLLAMA_MAX_RETRIES=2
+PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC=0.75
+PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6
 # optional account context used in Claude prompt:
 PICKINSTA_ACCOUNT_CONTEXT="motorcycle enthusiast account"
 ```
@@ -121,6 +137,20 @@ When `--scorer claude` is used, `pickinsta` checks:
 When `--scorer clip` is used, `HF_TOKEN` is optional. If present, `pickinsta`
 loads it from environment or `.env` (same search order) to reduce HF warnings
 and improve download/rate limits. If missing, CLIP still runs.
+
+When `--scorer ollama` is used, `PICKINSTA_OLLAMA_BASE_URL` and `PICKINSTA_OLLAMA_MODEL` are
+loaded from environment or `.env` (same search order). Defaults:
+- `PICKINSTA_OLLAMA_BASE_URL=http://127.0.0.1:11434`
+- `PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b`
+
+Performance defaults for Ollama are tuned for remote servers:
+- `PICKINSTA_OLLAMA_TIMEOUT_SEC=300` (avoid premature client disconnects)
+- `PICKINSTA_OLLAMA_MAX_IMAGE_EDGE=1024` and `PICKINSTA_OLLAMA_JPEG_QUALITY=80`
+- `PICKINSTA_OLLAMA_KEEP_ALIVE=10m` (keeps model loaded between requests)
+- `PICKINSTA_OLLAMA_USE_YOLO_CONTEXT=false` (set `true` for higher quality, slower)
+- `PICKINSTA_OLLAMA_CONCURRENCY=2` (parallel requests; start at 2-4 and tune per host)
+- `PICKINSTA_OLLAMA_MAX_RETRIES=2` with `PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC=0.75`
+- `PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6` (stops submitting new requests when the server is unhealthy)
 
 YOLO model weights are downloaded at runtime on first YOLO use to:
 - `~/.cache/pickinsta/models/yolov8n.pt`
@@ -149,12 +179,14 @@ Show full CLI options:
 pickinsta -h
 ```
 
-To score all Stage 2 images (CLIP or Claude), use `--all` instead of the `--vision-pct` cutoff:
+To score all Stage 2 images (CLIP, Claude, or Ollama), use `--all` instead of the `--vision-pct` cutoff:
 
 ```bash
 pickinsta ./input --output ./selected --scorer claude --all
 # or
 pickinsta ./input --output ./selected --scorer clip --all
+# or
+pickinsta ./input --output ./selected --scorer ollama --all
 ```
 
 For Claude, you can score on pre-cropped 4:5 candidates to better align
@@ -164,9 +196,30 @@ ranking with final portrait output quality:
 pickinsta ./input --output ./selected --scorer claude --all --claude-crop-first
 ```
 
+Benchmark Ollama with and without YOLO context (writes Markdown findings report):
+
+```bash
+.venv/bin/python tests/benchmarks/benchmark_ollama_yolo.py \
+  --input ./input \
+  --runs 2 \
+  --all \
+  --report docs/ollama-yolo-benchmark-report.md
+```
+
+Benchmark multiple Ollama models for processing speed (manual comparison report):
+
+```bash
+.venv/bin/python tests/benchmarks/benchmark_ollama_models.py \
+  --input ./input \
+  --all \
+  --runs 3 \
+  --models qwen3-vl:8b blaifa/InternVL3_5:8b blaifa/InternVL3_5:4B openbmb/minicpm-v4.5:8b \
+  --report docs/ollama-model-speed-benchmark-report.md
+```
+
 Reports are written to `./selected`:
 - `selection_report.json` (top selected outputs)
-- `selection_report.md` (top outputs + full vision/Claude scores for all analyzed images)
+- `selection_report.md` (top outputs + full technical and vision scores for all analyzed images)
 
 Output files:
 - `NN_<image-stem>.jpg` (always, ranked crop output)
