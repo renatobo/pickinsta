@@ -354,7 +354,7 @@ def test_score_with_ollama_sets_think_false_in_payload(tmp_path, monkeypatch) ->
     image_file = tmp_path / "payload.jpg"
     image_file.write_bytes(b"fake-image")
     monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
-    observed = {"think": None}
+    observed = {"think": None, "format": None, "num_predict": None, "prompt": None}
 
     class FakeResponse:
         def __enter__(self):
@@ -370,6 +370,9 @@ def test_score_with_ollama_sets_think_false_in_payload(tmp_path, monkeypatch) ->
     def fake_urlopen(request, timeout):
         observed_payload = json.loads(request.data.decode("utf-8"))
         observed["think"] = observed_payload.get("think")
+        observed["format"] = observed_payload.get("format")
+        observed["num_predict"] = observed_payload.get("options", {}).get("num_predict")
+        observed["prompt"] = observed_payload.get("messages", [{}])[0].get("content")
         return FakeResponse()
 
     monkeypatch.setattr(selector, "urlopen", fake_urlopen)
@@ -382,6 +385,72 @@ def test_score_with_ollama_sets_think_false_in_payload(tmp_path, monkeypatch) ->
     )
 
     assert observed["think"] is False
+    assert isinstance(observed["format"], dict)
+    assert observed["num_predict"] == selector.OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
+    assert "Return ONLY a JSON object" in (observed["prompt"] or "")
+
+
+def test_score_with_ollama_retries_compact_schema_after_neutral_fallback(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "retry-compact.jpg"
+    image_file.write_bytes(b"fake-image")
+    monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
+
+    calls: list[dict] = []
+    responses = [
+        {
+            "model": "openbmb/minicpm-v4.5:8b",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "thinking": "Got it, let's break down each criterion for this motorcycle photo.",
+            },
+        },
+        {
+            "model": "openbmb/minicpm-v4.5:8b",
+            "message": {
+                "role": "assistant",
+                "content": (
+                    '{"subject_clarity": 8, "lighting": 7, "color_pop": 8, "emotion": 8, '
+                    '"scroll_stop": 8, "crop_4x5": 7, "total": 46, '
+                    '"one_line": "Rider and bike are clearly framed with strong color contrast."}'
+                ),
+                "thinking": "",
+            },
+        },
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        calls.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse(responses[len(calls) - 1])
+
+    monkeypatch.setattr(selector, "urlopen", fake_urlopen)
+
+    result = selector.score_with_ollama(
+        image_path=image_file,
+        base_url="http://127.0.0.1:11434",
+        model="openbmb/minicpm-v4.5:8b",
+        use_yolo_context=False,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["format"] == "json"
+    assert isinstance(calls[1]["format"], dict)
+    assert "Return ONLY a JSON object" in calls[1]["messages"][0]["content"]
+    assert result["total"] == 46
+    assert "Rider and bike are clearly framed" in result["one_line"]
 
 
 def test_score_with_ollama_parses_plaintext_thinking_rubric(tmp_path, monkeypatch) -> None:
@@ -431,6 +500,52 @@ def test_score_with_ollama_parses_plaintext_thinking_rubric(tmp_path, monkeypatc
     assert result["scroll_stop"] == 8
     assert result["crop_4x5"] == 9
     assert result["total"] == 47
+
+
+def test_score_with_ollama_repairs_total_and_sanitizes_one_line(tmp_path, monkeypatch) -> None:
+    image_file = tmp_path / "thinking-repair.jpg"
+    image_file.write_bytes(b"fake-image")
+    monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read(self):
+            payload = {
+                "model": "qwen3-vl:8b",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "thinking": (
+                        "SUBJECT_CLARITY: 8/10\n"
+                        "LIGHTING: 9/10\n"
+                        "COLOR_POP: 8/10\n"
+                        "EMOTION: 6/10\n"
+                        "SCROLL_STOP: 7/10\n"
+                        "CROP_4x5: 8/10\n"
+                        "TOTAL: 8\n"
+                        'one_line: "Golden hour Ducati rider framed against mountains'
+                    ),
+                },
+            }
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    result = selector.score_with_ollama(
+        image_path=image_file,
+        base_url="http://127.0.0.1:11434",
+        model="qwen3-vl:8b",
+        use_yolo_context=False,
+    )
+
+    assert result["total"] == 46
+    assert not result["one_line"].startswith('"')
+    assert "Golden hour Ducati rider" in result["one_line"]
 
 
 def test_score_with_ollama_uses_neutral_fallback_for_prose_only_thinking(tmp_path, monkeypatch) -> None:

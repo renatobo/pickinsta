@@ -75,6 +75,11 @@ OLLAMA_CONCURRENCY_ENV_VAR = "PICKINSTA_OLLAMA_CONCURRENCY"
 OLLAMA_MAX_RETRIES_ENV_VAR = "PICKINSTA_OLLAMA_MAX_RETRIES"
 OLLAMA_BACKOFF_BASE_ENV_VAR = "PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC"
 OLLAMA_CIRCUIT_BREAKER_ENV_VAR = "PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS"
+OLLAMA_DEFAULT_NUM_PREDICT = 220
+OLLAMA_QWEN_NUM_PREDICT_SMALL_EDGE = 650
+OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE = 750
+OLLAMA_QWEN_SMALL_EDGE_THRESHOLD = 512
+OLLAMA_QWEN_MODEL_PREFIXES = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl")
 YOLO_MODEL_FILENAME = "yolov8n.pt"
 YOLO_MODEL_URL = "https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt"
 YOLO_MODEL_ENV_VAR = "PICKINSTA_YOLO_MODEL"
@@ -1019,11 +1024,161 @@ Rate each criterion 1-10 using these professional composition guidelines:
 Return ONLY valid JSON, no markdown:
 {{"subject_clarity": N, "lighting": N, "color_pop": N, "emotion": N, "scroll_stop": N, "crop_4x5": N, "total": N, "one_line": "why this works or doesn't"}}"""
 
+OLLAMA_COMPACT_JSON_PROMPT_TEMPLATE = """Evaluate this motorcycle photo for Instagram cover potential.
+
+Context: {account_context}.
+
+Return ONLY a JSON object with keys:
+- subject_clarity
+- lighting
+- color_pop
+- emotion
+- scroll_stop
+- crop_4x5
+- total
+- one_line
+
+Rules:
+- Score each criterion as an integer from 0 to 10.
+- total must equal the sum of the 6 criterion scores (0 to 60).
+- one_line must be exactly one concise sentence describing this specific image.
+"""
+
+OLLAMA_STRICT_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject_clarity": {"type": "integer", "minimum": 0, "maximum": 10},
+        "lighting": {"type": "integer", "minimum": 0, "maximum": 10},
+        "color_pop": {"type": "integer", "minimum": 0, "maximum": 10},
+        "emotion": {"type": "integer", "minimum": 0, "maximum": 10},
+        "scroll_stop": {"type": "integer", "minimum": 0, "maximum": 10},
+        "crop_4x5": {"type": "integer", "minimum": 0, "maximum": 10},
+        "total": {"type": "integer", "minimum": 0, "maximum": 60},
+        "one_line": {"type": "string"},
+    },
+    "required": [
+        "subject_clarity",
+        "lighting",
+        "color_pop",
+        "emotion",
+        "scroll_stop",
+        "crop_4x5",
+        "total",
+        "one_line",
+    ],
+    "additionalProperties": False,
+}
+
+VISION_SCORE_KEYS = (
+    "subject_clarity",
+    "lighting",
+    "color_pop",
+    "emotion",
+    "scroll_stop",
+    "crop_4x5",
+)
+
 
 def build_vision_prompt(account_context: str) -> str:
     """Build the Claude vision prompt with account-specific context."""
     context = account_context.strip() or DEFAULT_ACCOUNT_CONTEXT
     return VISION_PROMPT_TEMPLATE.format(account_context=context)
+
+
+def build_ollama_compact_json_prompt(account_context: str) -> str:
+    """Build compact strict-json prompt for Ollama models."""
+    context = account_context.strip() or DEFAULT_ACCOUNT_CONTEXT
+    return OLLAMA_COMPACT_JSON_PROMPT_TEMPLATE.format(account_context=context)
+
+
+def _extract_account_context_from_prompt(prompt_text: str) -> str:
+    """Best-effort extraction of account context from a full vision prompt."""
+    text = (prompt_text or "").strip()
+    if not text:
+        return DEFAULT_ACCOUNT_CONTEXT
+
+    match = re.search(
+        r"(?is)\bcontext:\s*(.+?)(?:\.\s*rate each criterion|\.\s*return only|\n\n)",
+        text,
+    )
+    if match:
+        context = match.group(1).strip().strip('"').strip("'")
+        if context:
+            return context
+    return DEFAULT_ACCOUNT_CONTEXT
+
+
+def _is_qwen_ollama_model(model: str) -> bool:
+    """Identify Qwen VL models that need stricter output controls."""
+    normalized = (model or "").strip().lower()
+    return any(normalized.startswith(prefix) for prefix in OLLAMA_QWEN_MODEL_PREFIXES)
+
+
+def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
+    """Choose a model-aware token budget for Ollama responses."""
+    if _is_qwen_ollama_model(model):
+        if max_image_edge <= OLLAMA_QWEN_SMALL_EDGE_THRESHOLD:
+            return OLLAMA_QWEN_NUM_PREDICT_SMALL_EDGE
+        return OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
+    return OLLAMA_DEFAULT_NUM_PREDICT
+
+
+def _sanitize_vision_one_line(raw_value: object, *, fallback_text: str = "") -> str:
+    """Clean up one-line summaries from partially formatted model output."""
+    line = str(raw_value or "").strip()
+    if not line:
+        first_sentence = re.split(r"(?<=[.!?])\s+", fallback_text.strip(), maxsplit=1)[0].strip()
+        line = first_sentence if first_sentence else "Vision scoring summary"
+
+    line = re.sub(r"\s+", " ", line).strip().strip("`")
+    if line.startswith(("'", '"')):
+        line = line[1:].strip()
+    if line.endswith(("'", '"')):
+        line = line[:-1].strip()
+    return line[:220] if line else "Vision scoring summary"
+
+
+def _normalize_ollama_vision_payload(vision: dict, *, fallback_text: str = "") -> dict:
+    """Normalize parsed vision payload to stable score ranges and text."""
+    if not isinstance(vision, dict):
+        return vision
+
+    normalized = dict(vision)
+    scores: dict[str, int] = {}
+    for key in VISION_SCORE_KEYS:
+        value = normalized.get(key)
+        if value is None:
+            continue
+        score = int(max(0, min(10, round(_safe_float(value, default=5.0)))))
+        scores[key] = score
+        normalized[key] = score
+
+    if len(scores) >= 3:
+        fill_value = int(round(sum(scores.values()) / len(scores)))
+        fill_value = max(0, min(10, fill_value))
+        for key in VISION_SCORE_KEYS:
+            if key not in scores:
+                scores[key] = fill_value
+                normalized[key] = fill_value
+        criteria_sum = int(sum(scores[key] for key in VISION_SCORE_KEYS))
+    else:
+        criteria_sum = None
+
+    total_raw = normalized.get("total")
+    total: Optional[int] = None
+    if total_raw is not None:
+        total = int(max(0, min(60, round(_safe_float(total_raw, default=30.0)))))
+    if criteria_sum is not None:
+        if total is None or (total < 10 and criteria_sum >= 20):
+            total = criteria_sum
+    if total is None:
+        total = 30
+    normalized["total"] = total
+    normalized["one_line"] = _sanitize_vision_one_line(
+        normalized.get("one_line", ""),
+        fallback_text=fallback_text,
+    )
+    return normalized
 
 
 def score_with_claude(
@@ -1127,36 +1282,43 @@ def _extract_json_payload(raw_text: str) -> str:
     return raw
 
 
-def _parse_ollama_message_json(body: str, parsed: dict) -> dict:
-    """Parse JSON model output from Ollama chat `message.content` or `message.thinking`."""
+def _parse_ollama_message_json_with_mode(body: str, parsed: dict) -> tuple[dict, str]:
+    """Parse Ollama message and return both normalized payload and parse mode."""
     message = parsed.get("message") if isinstance(parsed, dict) else None
     if not isinstance(message, dict):
         raise RuntimeError(f"Ollama response did not include message object: {body[:300]}")
 
     content = str(message.get("content") or "").strip()
     thinking = str(message.get("thinking") or "").strip()
-    for text in (content, thinking):
+    for source, text in (("content", content), ("thinking", thinking)):
         if not text:
             continue
         try:
-            return json.loads(_extract_json_payload(text))
+            parsed_json = json.loads(_extract_json_payload(text))
+            return _normalize_ollama_vision_payload(parsed_json, fallback_text=text), f"json-{source}"
         except Exception:
             continue
 
-    for text in (content, thinking):
+    for source, text in (("content", content), ("thinking", thinking)):
         fallback = _parse_ollama_plaintext_scores(text)
         if fallback is not None:
-            return fallback
+            return _normalize_ollama_vision_payload(fallback, fallback_text=text), f"plain-{source}"
 
-    for text in (content, thinking):
+    for source, text in (("content", content), ("thinking", thinking)):
         fallback = _ollama_neutral_fallback_from_text(text)
         if fallback is not None:
-            return fallback
+            return _normalize_ollama_vision_payload(fallback, fallback_text=text), f"neutral-{source}"
 
     raise RuntimeError(
         "Ollama response did not include parseable JSON in message content/thinking: "
         f"{body[:300]}"
     )
+
+
+def _parse_ollama_message_json(body: str, parsed: dict) -> dict:
+    """Compatibility wrapper returning only the normalized parsed payload."""
+    payload, _ = _parse_ollama_message_json_with_mode(body, parsed)
+    return payload
 
 
 def _parse_ollama_plaintext_scores(raw_text: str) -> Optional[dict]:
@@ -1337,42 +1499,79 @@ def score_with_ollama(
         jpeg_quality=jpeg_quality,
     )
 
-    enhanced_prompt = prompt or build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
-    if yolo_context:
-        enhanced_prompt = enhanced_prompt + yolo_context
-
-    payload = {
-        "model": model,
-        "stream": False,
-        "think": False,
-        "format": "json",
-        "keep_alive": keep_alive,
-        "options": {"temperature": 0, "num_predict": 220},
-        "messages": [{"role": "user", "content": enhanced_prompt, "images": [image_data]}],
-    }
-
     endpoint = f"{base_url.rstrip('/')}/api/chat"
-    request = Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            body = response.read().decode("utf-8")
-    except HTTPError as error:
-        details = ""
-        try:
-            details = error.read().decode("utf-8", errors="ignore")
-        except Exception:
-            details = ""
-        raise RuntimeError(f"Ollama request failed ({error.code}) at {endpoint}: {details[:300]}") from error
-    except URLError as error:
-        raise RuntimeError(f"Ollama connection failed for {endpoint}: {error}") from error
+    base_prompt = prompt or build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
+    if yolo_context:
+        base_prompt = base_prompt + yolo_context
 
-    parsed = json.loads(body)
-    return _parse_ollama_message_json(body, parsed)
+    def _send_ollama_request(*, active_prompt: str, response_format: object, num_predict: int) -> tuple[str, dict]:
+        payload = {
+            "model": model,
+            "stream": False,
+            "think": False,
+            "format": response_format,
+            "keep_alive": keep_alive,
+            "options": {"temperature": 0, "num_predict": num_predict},
+            "messages": [{"role": "user", "content": active_prompt, "images": [image_data]}],
+        }
+        request = Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except HTTPError as error:
+            details = ""
+            try:
+                details = error.read().decode("utf-8", errors="ignore")
+            except Exception:
+                details = ""
+            raise RuntimeError(
+                f"Ollama request failed ({error.code}) at {endpoint}: {details[:300]}"
+            ) from error
+        except URLError as error:
+            raise RuntimeError(f"Ollama connection failed for {endpoint}: {error}") from error
+        return body, json.loads(body)
+
+    use_qwen_profile = _is_qwen_ollama_model(model)
+    if use_qwen_profile:
+        account_context = _extract_account_context_from_prompt(base_prompt)
+        primary_prompt = build_ollama_compact_json_prompt(account_context)
+        if yolo_context:
+            primary_prompt = primary_prompt + yolo_context
+        primary_format: object = OLLAMA_STRICT_JSON_SCHEMA
+    else:
+        primary_prompt = base_prompt
+        primary_format = "json"
+
+    num_predict = _resolve_ollama_num_predict(model, max_image_edge=max_image_edge)
+    body, parsed = _send_ollama_request(
+        active_prompt=primary_prompt,
+        response_format=primary_format,
+        num_predict=num_predict,
+    )
+    payload, parse_mode = _parse_ollama_message_json_with_mode(body, parsed)
+
+    # Retry once when first pass degraded into plain/neutral fallback output.
+    if parse_mode.startswith("plain-") or parse_mode.startswith("neutral-"):
+        retry_context = _extract_account_context_from_prompt(base_prompt)
+        retry_prompt = build_ollama_compact_json_prompt(retry_context)
+        if yolo_context:
+            retry_prompt = retry_prompt + yolo_context
+        retry_body, retry_parsed = _send_ollama_request(
+            active_prompt=retry_prompt,
+            response_format=OLLAMA_STRICT_JSON_SCHEMA,
+            num_predict=num_predict,
+        )
+        retry_payload, retry_mode = _parse_ollama_message_json_with_mode(retry_body, retry_parsed)
+        if retry_mode.startswith("json-"):
+            return retry_payload
+        return retry_payload
+
+    return payload
 
 
 def _is_retryable_ollama_error(error: Exception) -> bool:
