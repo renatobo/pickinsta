@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual benchmark: compare Ollama model processing speed on the same image set."""
+"""Manual benchmark: compare model speed and quality on the same image set."""
 
 from __future__ import annotations
 
@@ -17,21 +17,34 @@ import pickinsta.ig_image_selector as selector
 from pickinsta.ig_image_selector import ImageScore
 
 
-DEFAULT_MODELS = [
+DEFAULT_OLLAMA_MODELS = [
     "qwen3-vl:8b",
     "blaifa/InternVL3_5:8b",
     "blaifa/InternVL3_5:4B",
     "openbmb/minicpm-v4.5:8b",
 ]
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+
+
+@dataclass
+class BenchmarkVariant:
+    label: str
+    scorer: str  # ollama | claude
+    model: str
+    yolo_enabled: bool
 
 
 @dataclass
 class RunMetrics:
+    variant_label: str
+    scorer: str
     model: str
+    yolo_enabled: bool
     run_index: int
     duration_sec: float
     images_count: int
     failed_count: int
+    ranked_rows: list[dict]
 
     @property
     def sec_per_image(self) -> float:
@@ -78,53 +91,92 @@ def _failed_item(item: ImageScore) -> bool:
         "technical-only",
         "circuit breaker",
         "ollama unavailable",
+        "claude unavailable",
     ]
     return any(marker in text for marker in markers)
 
 
-def _run_once(*, candidates: list[ImageScore], src: Path) -> tuple[float, int, int]:
+def _md_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _ranked_rows(ranked: list[ImageScore]) -> list[dict]:
+    rows: list[dict] = []
+    for idx, item in enumerate(ranked, start=1):
+        vision = item.vision if isinstance(item.vision, dict) else {}
+        src_name = (item.source_path or item.path).name
+        rows.append(
+            {
+                "rank": idx,
+                "filename": src_name,
+                "final_score": float(item.final_score),
+                "technical": float(item.technical.get("composite", 0.0)),
+                "subject_clarity": vision.get("subject_clarity", ""),
+                "lighting": vision.get("lighting", ""),
+                "color_pop": vision.get("color_pop", ""),
+                "emotion": vision.get("emotion", ""),
+                "scroll_stop": vision.get("scroll_stop", ""),
+                "crop_4x5": vision.get("crop_4x5", ""),
+                "vision_total": vision.get("total", ""),
+                "one_line": item.one_line or "",
+                "failed": _failed_item(item),
+            }
+        )
+    return rows
+
+
+def _run_once(*, candidates: list[ImageScore], src: Path, scorer: str) -> tuple[float, list[dict], int]:
     run_candidates = _clone_candidates(candidates)
     t0 = time.perf_counter()
     ranked = selector.batch_vision_score(
         run_candidates,
-        scorer="ollama",
+        scorer=scorer,
         env_search_dir=src,
     )
     duration = time.perf_counter() - t0
     failed_count = sum(1 for item in ranked if _failed_item(item))
-    return duration, len(ranked), failed_count
+    return duration, _ranked_rows(ranked), failed_count
 
 
-def _benchmark_model(
+def _benchmark_variant(
     *,
-    model: str,
+    variant: BenchmarkVariant,
     candidates: list[ImageScore],
     src: Path,
     runs: int,
-    yolo_enabled: bool,
     warmup: bool,
 ) -> list[RunMetrics]:
     metrics: list[RunMetrics] = []
-    env = {
-        selector.PICKINSTA_OLLAMA_MODEL_ENV_VAR: model,
-        selector.OLLAMA_USE_YOLO_ENV_VAR: "true" if yolo_enabled else "false",
-    }
+    env = {}
+    if variant.scorer == "ollama":
+        env[selector.PICKINSTA_OLLAMA_MODEL_ENV_VAR] = variant.model
+        env[selector.OLLAMA_USE_YOLO_ENV_VAR] = "true" if variant.yolo_enabled else "false"
+    elif variant.scorer == "claude":
+        env["ANTHROPIC_MODEL"] = variant.model
+
     with patched_env(env):
         if warmup:
-            # Warm model cache with a single image only (avoid full-pass warmup cost).
             warmup_candidates = candidates[:1]
             if warmup_candidates:
-                _run_once(candidates=warmup_candidates, src=src)
+                _run_once(candidates=warmup_candidates, src=src, scorer=variant.scorer)
                 time.sleep(10)
         for run_idx in range(1, runs + 1):
-            duration, images_count, failed_count = _run_once(candidates=candidates, src=src)
+            duration, ranked_rows, failed_count = _run_once(
+                candidates=candidates,
+                src=src,
+                scorer=variant.scorer,
+            )
             metrics.append(
                 RunMetrics(
-                    model=model,
+                    variant_label=variant.label,
+                    scorer=variant.scorer,
+                    model=variant.model,
+                    yolo_enabled=variant.yolo_enabled,
                     run_index=run_idx,
                     duration_sec=duration,
-                    images_count=images_count,
+                    images_count=len(ranked_rows),
                     failed_count=failed_count,
+                    ranked_rows=ranked_rows,
                 )
             )
     return metrics
@@ -134,14 +186,22 @@ def _avg(values: list[float]) -> float:
     return statistics.fmean(values) if values else 0.0
 
 
+def _first_run_by_variant(metrics: list[RunMetrics]) -> dict[str, RunMetrics]:
+    by_variant: dict[str, RunMetrics] = {}
+    for m in metrics:
+        if m.variant_label not in by_variant or m.run_index < by_variant[m.variant_label].run_index:
+            by_variant[m.variant_label] = m
+    return by_variant
+
+
 def _write_report(
     *,
     report_path: Path,
     src: Path,
     candidates_count: int,
     runs: int,
-    yolo_enabled: bool,
     warmup: bool,
+    variants: list[BenchmarkVariant],
     all_metrics: list[RunMetrics],
 ) -> None:
     ts = datetime.now().isoformat(timespec="seconds")
@@ -152,56 +212,106 @@ def _write_report(
 
     grouped: dict[str, list[RunMetrics]] = {}
     for metric in all_metrics:
-        grouped.setdefault(metric.model, []).append(metric)
+        grouped.setdefault(metric.variant_label, []).append(metric)
 
-    summary_rows: list[tuple[str, float, float, float, float]] = []
-    for model, metrics in grouped.items():
+    summary_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
+    for variant in variants:
+        metrics = grouped.get(variant.label, [])
+        if not metrics:
+            continue
+        avg_sec = _avg([m.sec_per_image for m in metrics])
         summary_rows.append(
             (
-                model,
-                _avg([m.sec_per_image for m in metrics]),
+                variant.label,
+                variant.scorer,
+                variant.model,
+                "on" if variant.yolo_enabled else "off",
+                avg_sec,
                 _avg([m.images_per_min for m in metrics]),
                 _avg([m.duration_sec for m in metrics]),
                 _avg([float(m.failed_count) for m in metrics]),
             )
         )
-    summary_rows.sort(key=lambda row: row[1])
-
-    fastest_sec_per_img = summary_rows[0][1] if summary_rows else 0.0
+    summary_rows.sort(key=lambda row: row[4])
+    fastest_sec_per_img = summary_rows[0][4] if summary_rows else 0.0
 
     lines: list[str] = []
-    lines.append("# Ollama Model Speed Benchmark Report")
+    lines.append("# Model Benchmark Report (Speed + Quality)")
     lines.append("")
     lines.append(f"- Generated: `{ts}`")
     lines.append(f"- Input folder: `{src}`")
     lines.append(f"- Candidates scored per run: `{candidates_count}`")
-    lines.append(f"- Runs per model: `{runs}`")
-    lines.append(f"- Warmup run before timed runs: `{warmup}`")
-    lines.append(f"- YOLO context enabled: `{yolo_enabled}`")
+    lines.append(f"- Runs per variant: `{runs}`")
+    lines.append(f"- Warmup enabled: `{warmup}` (1 image + 10s wait)")
     lines.append(f"- Ollama base URL: `{base_url}`")
-    lines.append(f"- Concurrency: `{concurrency}`")
-    lines.append(f"- Max retries: `{retries}`")
-    lines.append(f"- Keep alive: `{keep_alive}`")
+    lines.append(f"- Ollama concurrency: `{concurrency}`")
+    lines.append(f"- Ollama max retries: `{retries}`")
+    lines.append(f"- Ollama keep_alive: `{keep_alive}`")
     lines.append("")
-    lines.append("## Summary")
+    lines.append("## Speed Summary")
     lines.append("")
-    lines.append("| Model | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | Speed vs fastest |")
-    lines.append("|---|---:|---:|---:|---:|---:|")
-    for model, sec_img, img_min, duration, failures in summary_rows:
+    lines.append("| Variant | Scorer | Model | YOLO | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | Speed vs fastest |")
+    lines.append("|---|---|---|---|---:|---:|---:|---:|---:|")
+    for label, scorer_name, model, yolo, sec_img, img_min, duration, failures in summary_rows:
         speed_factor = (sec_img / fastest_sec_per_img) if fastest_sec_per_img > 0 else 0.0
         lines.append(
-            f"| {model} | {sec_img:.2f} | {img_min:.2f} | {duration:.2f} | {failures:.2f} | {speed_factor:.2f}x |"
+            f"| {_md_escape(label)} | {scorer_name} | {_md_escape(model)} | {yolo} | "
+            f"{sec_img:.2f} | {img_min:.2f} | {duration:.2f} | {failures:.2f} | {speed_factor:.2f}x |"
         )
 
     lines.append("")
-    lines.append("## Per-run Details")
+    lines.append("## Per-run Timing")
     lines.append("")
-    lines.append("| Model | Run | Duration (s) | Sec/img | Imgs/min | Failures |")
+    lines.append("| Variant | Run | Duration (s) | Sec/img | Imgs/min | Failures |")
     lines.append("|---|---:|---:|---:|---:|---:|")
-    for model, metrics in grouped.items():
-        for m in sorted(metrics, key=lambda x: x.run_index):
+    for variant in variants:
+        for m in sorted(grouped.get(variant.label, []), key=lambda x: x.run_index):
             lines.append(
-                f"| {model} | {m.run_index} | {m.duration_sec:.2f} | {m.sec_per_image:.2f} | {m.images_per_min:.2f} | {m.failed_count} |"
+                f"| {_md_escape(variant.label)} | {m.run_index} | {m.duration_sec:.2f} | "
+                f"{m.sec_per_image:.2f} | {m.images_per_min:.2f} | {m.failed_count} |"
+            )
+
+    first_runs = _first_run_by_variant(all_metrics)
+    if first_runs:
+        lines.append("")
+        lines.append("## Image-by-Image Score Comparison (Run 1)")
+        lines.append("")
+        variant_labels = [v.label for v in variants if v.label in first_runs]
+        images = sorted({row["filename"] for m in first_runs.values() for row in m.ranked_rows})
+        header = "| Image |" + "".join([f" {_md_escape(v)} final | {_md_escape(v)} rank |" for v in variant_labels])
+        sep = "|---|" + "".join(["---:|---:|" for _ in variant_labels])
+        lines.append(header)
+        lines.append(sep)
+        for image in images:
+            line = f"| {_md_escape(image)} |"
+            for v in variant_labels:
+                rows = first_runs[v].ranked_rows
+                row = next((r for r in rows if r["filename"] == image), None)
+                if row is None:
+                    line += "  |  |"
+                else:
+                    line += f" {row['final_score']:.4f} | {row['rank']} |"
+            lines.append(line)
+
+    lines.append("")
+    lines.append("## Ranked Quality Details (All Images)")
+    lines.append("")
+    lines.append("_Each section below is from timed run 1 for that variant._")
+    for variant in variants:
+        run = first_runs.get(variant.label)
+        if run is None:
+            continue
+        lines.append("")
+        lines.append(f"### {variant.label}")
+        lines.append("")
+        lines.append("| Rank | Image | Final | Tech | Vision | Subject | Light | Color | Emotion | Scroll | Crop | Failed | One line |")
+        lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
+        for row in run.ranked_rows:
+            lines.append(
+                f"| {row['rank']} | {_md_escape(row['filename'])} | {row['final_score']:.4f} | "
+                f"{row['technical']:.4f} | {row['vision_total']} | {row['subject_clarity']} | "
+                f"{row['lighting']} | {row['color_pop']} | {row['emotion']} | {row['scroll_stop']} | "
+                f"{row['crop_4x5']} | {'yes' if row['failed'] else 'no'} | {_md_escape(str(row['one_line']))} |"
             )
 
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +320,7 @@ def _write_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Manual benchmark to compare Ollama model processing speed on the same image set.",
+        description="Benchmark models for speed + quality on the same candidate image set.",
     )
     parser.add_argument(
         "--input",
@@ -220,17 +330,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs",
         type=int,
-        default=3,
-        help="Number of timed runs per model (default: 3).",
+        default=1,
+        help="Number of timed runs per variant (default: 1).",
     )
     parser.add_argument(
         "--models",
         nargs="+",
-        default=DEFAULT_MODELS,
+        default=DEFAULT_OLLAMA_MODELS,
         help=(
-            "Model tags to compare (space-separated). "
+            "Ollama model tags to compare (space-separated). "
             "Default: qwen3-vl:8b blaifa/InternVL3_5:8b blaifa/InternVL3_5:4B openbmb/minicpm-v4.5:8b"
         ),
+    )
+    parser.add_argument(
+        "--variants",
+        choices=["off", "on", "both"],
+        default="off",
+        help="YOLO variants to run for Ollama models (default: off).",
+    )
+    parser.add_argument(
+        "--include-claude",
+        action="store_true",
+        help="Include Claude scorer as additional baseline variant.",
+    )
+    parser.add_argument(
+        "--claude-model",
+        default=DEFAULT_CLAUDE_MODEL,
+        help=f"Claude model used when --include-claude is set (default: {DEFAULT_CLAUDE_MODEL}).",
     )
     parser.add_argument(
         "--top",
@@ -250,21 +376,48 @@ def parse_args() -> argparse.Namespace:
         help="Score all Stage 2 candidates.",
     )
     parser.add_argument(
-        "--yolo",
-        action="store_true",
-        help="Enable YOLO context during benchmark (default: off for pure model speed comparison).",
-    )
-    parser.add_argument(
         "--no-warmup",
         action="store_true",
-        help="Disable per-model warmup (default warmup scores 1 image, then waits 10s).",
+        help="Disable per-variant warmup (default warmup scores 1 image, then waits 10s).",
     )
     parser.add_argument(
         "--report",
-        default="docs/ollama-model-speed-benchmark-report.md",
-        help="Output Markdown report path (default: docs/ollama-model-speed-benchmark-report.md).",
+        default="docs/ollama-model-benchmark-report.md",
+        help="Output Markdown report path (default: docs/ollama-model-benchmark-report.md).",
     )
     return parser.parse_args()
+
+
+def _build_variants(args: argparse.Namespace, models: list[str]) -> list[BenchmarkVariant]:
+    variants: list[BenchmarkVariant] = []
+    yolo_modes = [False]
+    if args.variants == "on":
+        yolo_modes = [True]
+    elif args.variants == "both":
+        yolo_modes = [False, True]
+
+    for yolo_enabled in yolo_modes:
+        yolo_label = "on" if yolo_enabled else "off"
+        for model in models:
+            variants.append(
+                BenchmarkVariant(
+                    label=f"{model} | yolo={yolo_label}",
+                    scorer="ollama",
+                    model=model,
+                    yolo_enabled=yolo_enabled,
+                )
+            )
+
+    if args.include_claude:
+        variants.append(
+            BenchmarkVariant(
+                label=f"{args.claude_model} | scorer=claude",
+                scorer="claude",
+                model=args.claude_model,
+                yolo_enabled=False,
+            )
+        )
+    return variants
 
 
 def main() -> None:
@@ -278,6 +431,10 @@ def main() -> None:
         raise SystemExit("--runs must be >= 1")
     if not models:
         raise SystemExit("No models provided.")
+
+    variants = _build_variants(args, models)
+    if not variants:
+        raise SystemExit("No benchmark variants selected.")
 
     warmup = not args.no_warmup
 
@@ -298,17 +455,16 @@ def main() -> None:
         raise SystemExit("No candidates selected for benchmark.")
 
     print(
-        f"🧪 Benchmarking {len(models)} model(s) on {len(candidates)} candidates, {args.runs} run(s) per model"
+        f"🧪 Benchmarking {len(variants)} variant(s) on {len(candidates)} candidates, {args.runs} run(s) each"
     )
     all_metrics: list[RunMetrics] = []
-    for idx, model in enumerate(models, start=1):
-        print(f"➡️  Model {idx}/{len(models)}: {model}")
-        metrics = _benchmark_model(
-            model=model,
+    for idx, variant in enumerate(variants, start=1):
+        print(f"➡️  Variant {idx}/{len(variants)}: {variant.label}")
+        metrics = _benchmark_variant(
+            variant=variant,
             candidates=candidates,
             src=src,
             runs=args.runs,
-            yolo_enabled=args.yolo,
             warmup=warmup,
         )
         all_metrics.extend(metrics)
@@ -318,8 +474,8 @@ def main() -> None:
         src=src,
         candidates_count=len(candidates),
         runs=args.runs,
-        yolo_enabled=args.yolo,
         warmup=warmup,
+        variants=variants,
         all_metrics=all_metrics,
     )
     print(f"📝 Report written: {report_path}")
