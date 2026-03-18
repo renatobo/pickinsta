@@ -47,12 +47,14 @@ def test_main_parses_cli_and_invokes_run_pipeline(monkeypatch, tmp_path) -> None
     assert captured == {
         "input_folder": str(input_dir),
         "output_folder": str(output_dir),
+        "work_folder": None,
         "top_n": 3,
         "scorer": "claude",
         "vision_candidates_pct": 0.75,
         "claude_model": "claude-test-model",
         "score_all": True,
         "claude_crop_first": True,
+        "rescore": False,
     }
 
 

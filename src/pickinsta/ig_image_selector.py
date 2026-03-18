@@ -62,7 +62,7 @@ DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 CLAUDE_MIN_CROP4X5_OUTPUT_SCORE = 6.0
-DEFAULT_ACCOUNT_CONTEXT = "motorcycle enthusiast account"
+DEFAULT_ACCOUNT_CONTEXT = "Ducati motorcycle enthusiast account"
 ACCOUNT_CONTEXT_ENV_VAR = "PICKINSTA_ACCOUNT_CONTEXT"
 PICKINSTA_OLLAMA_BASE_URL_ENV_VAR = "PICKINSTA_OLLAMA_BASE_URL"
 PICKINSTA_OLLAMA_MODEL_ENV_VAR = "PICKINSTA_OLLAMA_MODEL"
@@ -402,8 +402,13 @@ def load_claude_score_from_file_cache(
     source_sha256: str,
     model: str,
     prompt_sha256: str,
+    strict_model: bool = True,
 ) -> Optional[dict]:
-    """Load cached Claude score for a specific source file if still valid."""
+    """Load cached Claude score for a specific source file if still valid.
+
+    Args:
+        strict_model: When False, accept cached scores from any model (skip model check).
+    """
     cache_file = claude_cache_file_for_source(source_path)
     if not cache_file.exists():
         return None
@@ -417,7 +422,7 @@ def load_claude_score_from_file_cache(
         return None
     if payload.get("source_sha256") != source_sha256:
         return None
-    if payload.get("model") != model:
+    if strict_model and payload.get("model") != model:
         return None
     if payload.get("prompt_sha256") != prompt_sha256:
         return None
@@ -609,13 +614,34 @@ def resize_for_processing(
 # ---------------------------------------------------------------------------
 
 
+HIST_DEDUP_THRESHOLD = 0.92  # histogram correlation; higher = stricter
+HIST_DEDUP_THUMB_SIZE = (256, 256)
+
+
+def _image_histogram(img_path: Path) -> Optional[np.ndarray]:
+    """Compute a normalized color histogram for burst-shot dedup."""
+    try:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return None
+        thumb = cv2.resize(img, HIST_DEDUP_THUMB_SIZE)
+        hist = cv2.calcHist([thumb], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        cv2.normalize(hist, hist)
+        return hist
+    except Exception:
+        return None
+
+
 def deduplicate(images: list[Path], threshold: int = DEDUP_THRESHOLD) -> list[Path]:
     """
-    Remove near-duplicate images using perceptual hashing.
+    Remove near-duplicate images using perceptual hashing,
+    then a second pass using histogram correlation to catch burst shots
+    with shifted framing that hash-dedup misses.
     Returns one representative from each group of similar images.
     """
     import imagehash
 
+    # Pass 1: perceptual hash dedup
     hash_groups: dict[imagehash.ImageHash, list[Path]] = {}
 
     for img_path in images:
@@ -633,15 +659,43 @@ def deduplicate(images: list[Path], threshold: int = DEDUP_THRESHOLD) -> list[Pa
             print(f"  ⚠ Hash failed for {img_path.name}: {e}")
 
     # From each group, pick the largest file (usually highest quality)
-    unique = []
-    duplicates_removed = 0
+    hash_unique = []
+    hash_removed = 0
     for group in hash_groups.values():
         best = max(group, key=lambda p: p.stat().st_size)
+        hash_unique.append(best)
+        hash_removed += len(group) - 1
+
+    # Pass 2: histogram correlation to catch burst shots
+    hist_groups: list[list[tuple[Path, np.ndarray]]] = []
+    for img_path in hash_unique:
+        hist = _image_histogram(img_path)
+        if hist is None:
+            hist_groups.append([(img_path, np.array([]))])
+            continue
+        placed = False
+        for group in hist_groups:
+            ref_hist = group[0][1]
+            if ref_hist.size > 0:
+                corr = cv2.compareHist(ref_hist, hist, cv2.HISTCMP_CORREL)
+                if corr >= HIST_DEDUP_THRESHOLD:
+                    group.append((img_path, hist))
+                    placed = True
+                    break
+        if not placed:
+            hist_groups.append([(img_path, hist)])
+
+    unique = []
+    hist_removed = 0
+    for group in hist_groups:
+        paths = [p for p, _ in group]
+        best = max(paths, key=lambda p: p.stat().st_size)
         unique.append(best)
-        duplicates_removed += len(group) - 1
+        hist_removed += len(group) - 1
 
     print(
-        f"  ✅ Dedup: {len(images)} → {len(unique)} unique ({duplicates_removed} duplicates removed)"
+        f"  ✅ Dedup: {len(images)} → {len(unique)} unique "
+        f"({hash_removed} hash dupes, {hist_removed} burst dupes removed)"
     )
     return unique
 
@@ -959,14 +1013,53 @@ def _print_score_distribution(results: list[ImageScore]) -> None:
     print("     └" + "─" * (bar_width + 18) + "┘")
 
 
+def _tech_cache_path(img_path: Path) -> Path:
+    """Return the technical score cache file path for an image."""
+    return img_path.with_suffix(img_path.suffix + ".techscore.json")
+
+
+def _load_tech_cache(img_path: Path) -> Optional[dict]:
+    """Load cached technical score if still valid (mtime match)."""
+    cache = _tech_cache_path(img_path)
+    if not cache.exists():
+        return None
+    try:
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("mtime") != img_path.stat().st_mtime:
+        return None
+    scores = payload.get("scores")
+    return scores if isinstance(scores, dict) else None
+
+
+def _save_tech_cache(img_path: Path, tech: dict) -> None:
+    """Persist technical scores keyed on file mtime."""
+    cache = _tech_cache_path(img_path)
+    payload = {"mtime": img_path.stat().st_mtime, "scores": tech}
+    try:
+        cache.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def batch_technical_score(
     images: list[Path], source_map: Optional[dict[Path, Path]] = None
 ) -> list[ImageScore]:
     """Score all images technically and return sorted list."""
     results = []
+    cache_hits = 0
     for img_path in images:
         try:
-            tech = score_technical(img_path)
+            cached = _load_tech_cache(img_path)
+            if cached is not None:
+                tech = cached
+                cache_hits += 1
+            else:
+                tech = score_technical(img_path)
+                _save_tech_cache(img_path, tech)
             results.append(
                 ImageScore(
                     path=img_path,
@@ -979,7 +1072,8 @@ def batch_technical_score(
 
     results.sort(key=lambda x: x.technical.get("composite", 0), reverse=True)
     print(
-        f"  ✅ Technical scoring complete. Top: {results[0].path.name} ({results[0].technical['composite']:.3f})"
+        f"  ✅ Technical scoring complete ({cache_hits}/{len(results)} cached). "
+        f"Top: {results[0].path.name} ({results[0].technical['composite']:.3f})"
     )
     _print_score_distribution(results)
     return results
@@ -1021,6 +1115,10 @@ Rate each criterion 1-10 using these professional composition guidelines:
    - Would cropping to portrait cut off wheels, handlebars, or exhaust?
    - Would the subject remain well-composed in Instagram's 3:4 grid thumbnail?
 
+BRAND PRIORITY: This is a Ducati-focused account. If the motorcycle is identifiably NOT a Ducati
+(e.g. Japanese brands, BMW, KTM, Harley, etc.), reduce SUBJECT_CLARITY and EMOTION scores by 3
+points each (minimum 1). Ducati bikes or unidentifiable brands score normally.
+
 Return ONLY valid JSON, no markdown:
 {{"subject_clarity": N, "lighting": N, "color_pop": N, "emotion": N, "scroll_stop": N, "crop_4x5": N, "total": N, "one_line": "why this works or doesn't"}}"""
 
@@ -1042,6 +1140,7 @@ Rules:
 - Score each criterion as an integer from 0 to 10.
 - total must equal the sum of the 6 criterion scores (0 to 60).
 - one_line must be exactly one concise sentence describing this specific image.
+- BRAND PRIORITY: This is a Ducati-focused account. If the motorcycle is identifiably NOT a Ducati (e.g. Japanese brands, BMW, KTM, Harley, etc.), reduce subject_clarity and emotion by 3 each (minimum 1). Ducati or unidentifiable brands score normally.
 """
 
 OLLAMA_STRICT_JSON_SCHEMA = {
@@ -1237,12 +1336,24 @@ def score_with_claude(
             # Silently fail - YOLO context is optional
             pass
 
-    # Read and encode — images are already resized to max 1920px
-    with open(image_path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-
-    suffix = image_path.suffix.lower()
-    media_type = "image/png" if suffix == ".png" else "image/jpeg"
+    # Downsize for scoring — 1024px is sufficient for composition evaluation
+    # and significantly reduces API token cost vs sending full 1920px images.
+    CLAUDE_SCORING_MAX_EDGE = 1024
+    CLAUDE_SCORING_JPEG_QUALITY = 75
+    with Image.open(image_path) as img:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        w, h = img.size
+        longest = max(w, h)
+        if longest > CLAUDE_SCORING_MAX_EDGE:
+            scale = CLAUDE_SCORING_MAX_EDGE / longest
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=CLAUDE_SCORING_JPEG_QUALITY, optimize=True)
+        image_data = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    media_type = "image/jpeg"
 
     # Enhance prompt with YOLO detection context if available
     enhanced_prompt = prompt or build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
@@ -1653,6 +1764,7 @@ def batch_vision_score(
     scorer: str = "clip",
     env_search_dir: Optional[Path] = None,
     claude_model: Optional[str] = None,
+    rescore: bool = False,
 ) -> list[ImageScore]:
     """Run vision scoring on candidate images."""
 
@@ -1912,11 +2024,12 @@ def batch_vision_score(
             if scorer == "claude":
                 source_for_cache = item.source_path or item.path
                 source_sha256 = _file_sha256(source_for_cache)
-                cached = load_claude_score_from_file_cache(
+                cached = None if rescore else load_claude_score_from_file_cache(
                     source_path=source_for_cache,
                     source_sha256=source_sha256,
                     model=active_claude_model,
                     prompt_sha256=claude_prompt_hash,
+                    strict_model=False,
                 )
                 if cached is not None:
                     item.vision = cached
@@ -3053,12 +3166,14 @@ def _prepare_claude_crop_first_candidates(
 def run_pipeline(
     input_folder: str,
     output_folder: str = "selected",
+    work_folder: Optional[str] = None,
     top_n: int = 10,
     scorer: str = "clip",
     vision_candidates_pct: float = 0.5,
     claude_model: Optional[str] = None,
     score_all: bool = False,
     claude_crop_first: bool = False,
+    rescore: bool = False,
 ):
     """
     Full pipeline: resize → deduplicate → technical score → vision score → crop → output.
@@ -3066,6 +3181,7 @@ def run_pipeline(
     Args:
         input_folder: Path to folder with raw event photos
         output_folder: Path for final 1080x1440 output images
+        work_folder: Path for intermediate work files (default: <input>_work next to input)
         top_n: Number of top images to output
         scorer: "clip" (free/local), "claude" (best quality, API costs), or "ollama" (self-hosted)
         vision_candidates_pct: Send top N% of technically-scored images to vision scoring
@@ -3074,7 +3190,7 @@ def run_pipeline(
     """
     src = Path(input_folder)
     out = Path(output_folder)
-    work = src.parent / f"{src.name}_work"
+    work = Path(work_folder) if work_folder else src.parent / f"{src.name}_work"
 
     if not src.exists():
         print(f"❌ Input folder not found: {src}")
@@ -3118,12 +3234,36 @@ def run_pipeline(
         )
         candidates = _prepare_claude_crop_first_candidates(candidates, work_folder=work)
     scope = "all" if score_all else f"top {len(candidates)}"
+    if scorer == "claude":
+        cost_per_image = 0.005
+        if rescore:
+            uncached = len(candidates)
+        else:
+            claude_est_prompt = build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
+            claude_est_hash = claude_prompt_sha256(claude_est_prompt)
+            claude_est_model = claude_model or resolve_claude_model()
+            uncached = 0
+            for item in candidates:
+                sp = item.source_path or item.path
+                cached = load_claude_score_from_file_cache(
+                    source_path=sp, source_sha256=_file_sha256(sp),
+                    model=claude_est_model, prompt_sha256=claude_est_hash,
+                    strict_model=False,
+                )
+                if cached is None:
+                    uncached += 1
+        est_cost = uncached * cost_per_image
+        print(
+            f"\n💰 Claude estimate: {uncached}/{len(candidates)} images to score, "
+            f"~${est_cost:.2f} ({len(candidates) - uncached} cached)"
+        )
     print(f"\n🧠 Stage 3: Vision scoring {scope} candidates ({scorer})...")
     ranked = batch_vision_score(
         candidates,
         scorer=scorer,
         env_search_dir=src,
         claude_model=claude_model,
+        rescore=rescore,
     )
 
     # --- Stage 4: Output top N cropped to 1080x1440 ---
@@ -3160,20 +3300,22 @@ def run_pipeline(
     for i, item in enumerate(top):
         rank = i + 1
         output_stem = (item.source_path or item.path).stem
-        dest = out / f"{rank:02d}_{output_stem}.jpg"
-        dest_full = out / f"{rank:02d}_full_{output_stem}.jpg"
+        dest_cropped = out / f"{rank:02d}_cropped_{output_stem}.jpg"
+        dest_hd = out / f"{rank:02d}_hd_{output_stem}.jpg"
+        dest_full = out / f"{rank:02d}_full_{output_stem}{(item.source_path or item.path).suffix}"
         display_name = (item.source_path or item.path).name
         padded_written = False
         crop_meta: dict[str, object] = {}
+
+        # Cropped: IG 1080x1440 smart crop
         try:
-            smart_crop(item.path, dest, save_debug=True, meta_out=crop_meta)
+            smart_crop(item.path, dest_cropped, save_debug=True, meta_out=crop_meta)
         except Exception:
-            # Fallback: simple center crop via PIL
             try:
                 with Image.open(item.path) as img:
                     img = img.convert("RGB")
                     img = img.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.LANCZOS)
-                    img.save(dest, "JPEG", quality=95)
+                    img.save(dest_cropped, "JPEG", quality=95)
                 crop_meta = {
                     "uncertain_crop": True,
                     "uncertain_crop_reasons": ["smart_crop_failed_used_center_resize_fallback"],
@@ -3182,13 +3324,20 @@ def run_pipeline(
                 print(f"  ⚠ Could not process {item.path.name}: {e2}")
                 continue
 
-        # Additional non-ranked full-subject portrait variant only when crop is uncertain.
-        if bool(crop_meta.get("uncertain_crop", False)):
-            try:
-                write_padded_full_subject(item.source_path or item.path, dest_full)
-                padded_written = True
-            except Exception as e3:
-                print(f"  ⚠ Could not write full-subject variant for {display_name}: {e3}")
+        # HD: 1920px longest edge (work copy)
+        import shutil
+        try:
+            shutil.copy2(str(item.path), str(dest_hd))
+        except Exception as e3:
+            print(f"  ⚠ Could not copy HD version for {display_name}: {e3}")
+
+        # Full: original source file
+        try:
+            source = item.source_path or item.path
+            shutil.copy2(str(source), str(dest_full))
+            padded_written = True
+        except Exception as e3:
+            print(f"  ⚠ Could not copy full version for {display_name}: {e3}")
 
         report.append(
             {
@@ -3198,14 +3347,15 @@ def run_pipeline(
                 "technical_composite": round(item.technical.get("composite", 0), 4),
                 "vision_total": item.vision.get("total", 0),
                 "one_line": item.one_line,
-                "output": dest.name,
-                "output_full_subject": dest_full.name if padded_written else None,
+                "output_cropped": dest_cropped.name,
+                "output_hd": dest_hd.name,
+                "output_full": dest_full.name if padded_written else None,
                 "uncertain_crop": bool(crop_meta.get("uncertain_crop", False)),
                 "uncertain_crop_reasons": crop_meta.get("uncertain_crop_reasons", []),
             }
         )
 
-        print(f"  #{rank}: {display_name} → {dest.name}")
+        print(f"  #{rank}: {display_name} → {dest_cropped.name}")
         print(
             f"       Score: {item.final_score:.3f} | Tech: {item.technical.get('composite', 0):.3f} | Vision: {item.vision.get('total', 0)}"
         )
@@ -3267,6 +3417,9 @@ Examples:
         "--output", "-o", default="selected", help="Output folder (default: selected)"
     )
     parser.add_argument(
+        "--work", "-w", default=None, help="Work folder for intermediate files (default: <input>_work next to input)"
+    )
+    parser.add_argument(
         "--top", "-n", type=int, default=10, help="Number of top images to output (default: 10)"
     )
     parser.add_argument(
@@ -3305,18 +3458,25 @@ Examples:
             "Claude scoring to better align ranking with final crop quality."
         ),
     )
+    parser.add_argument(
+        "--rescore",
+        action="store_true",
+        help="Force re-scoring all images, ignoring cached vision scores.",
+    )
 
     args = parser.parse_args()
 
     run_pipeline(
         input_folder=args.input,
         output_folder=args.output,
+        work_folder=args.work,
         top_n=args.top,
         scorer=args.scorer,
         vision_candidates_pct=args.vision_pct,
         claude_model=args.claude_model,
         score_all=args.score_all,
         claude_crop_first=args.claude_crop_first,
+        rescore=args.rescore,
     )
 
 
