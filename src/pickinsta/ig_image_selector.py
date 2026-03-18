@@ -58,7 +58,7 @@ OUTPUT_WIDTH = 1080  # Instagram output width
 OUTPUT_HEIGHT = 1440  # Instagram output height (3:4 ratio)
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".tiff", ".bmp"}
 DEDUP_THRESHOLD = 8  # perceptual hash distance; lower = stricter
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_OLLAMA_MODEL = "qwen2.5vl:7b"
 DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 CLAUDE_MIN_CROP4X5_OUTPUT_SCORE = 6.0
@@ -466,6 +466,8 @@ class ImageScore:
     vision: dict = field(default_factory=dict)
     final_score: float = 0.0
     one_line: str = ""
+    burst_group: Optional[list[Path]] = None  # all images in the burst (if any)
+    burst_selected_by: str = ""  # "sharpness" or "technical"
 
 
 def _md_escape(value: object) -> str:
@@ -550,13 +552,52 @@ def write_markdown_report(
 # ---------------------------------------------------------------------------
 
 
+def _resize_one_image(args: tuple[Path, Path]) -> Optional[tuple[Path, Path]]:
+    """Resize a single image. Used by ProcessPoolExecutor. Returns (dest, source) or None."""
+    img_path, dest = args
+    try:
+        from PIL import ImageOps
+
+        with Image.open(img_path) as img:
+            # Preserve EXIF data (timestamps needed for burst detection)
+            # but reset orientation tag since exif_transpose already rotated pixels
+            exif_bytes = img.info.get("exif")
+            img = ImageOps.exif_transpose(img)
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            w, h = img.size
+            longest = max(w, h)
+            if longest > MAX_RESIZE_PX:
+                scale = MAX_RESIZE_PX / longest
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            save_kwargs = {"quality": 90}
+            if exif_bytes:
+                try:
+                    from PIL.Image import Exif
+                    exif_obj = Exif()
+                    exif_obj.load(exif_bytes)
+                    # 0x0112 = Orientation tag — reset to normal (1)
+                    if 0x0112 in exif_obj:
+                        exif_obj[0x0112] = 1
+                    save_kwargs["exif"] = exif_obj.tobytes()
+                except Exception:
+                    save_kwargs["exif"] = exif_bytes
+            img.save(dest, "JPEG", **save_kwargs)
+        return (dest, img_path)
+    except Exception:
+        return None
+
+
 def resize_for_processing(
     src_folder: Path, work_folder: Path
 ) -> tuple[list[Path], dict[Path, Path]]:
     """
     Copy all images to work_folder, resized so the longest edge <= MAX_RESIZE_PX.
-    Preserves EXIF orientation. Returns list of resized image paths.
+    Preserves EXIF orientation. Uses multiple CPU cores for resizing.
+    Returns list of resized image paths and source map.
     """
+    from concurrent.futures import ProcessPoolExecutor
+
     work_folder.mkdir(parents=True, exist_ok=True)
     resized: list[Path] = []
     source_map: dict[Path, Path] = {}
@@ -567,44 +608,36 @@ def resize_for_processing(
     ]
     print(f"📁 Found {len(src_images)} images in {src_folder}")
 
+    # Separate cached vs needs-resize
+    to_resize: list[tuple[Path, Path]] = []
     for img_path in src_images:
-        try:
-            dest = work_folder / f"{img_path.stem}.jpg"
-            # Reuse prior output when it is up-to-date to avoid re-encoding.
-            if dest.exists() and dest.stat().st_mtime >= img_path.stat().st_mtime:
-                resized.append(dest)
-                source_map[dest] = img_path
-                reused += 1
-                continue
+        dest = work_folder / f"{img_path.stem}.jpg"
+        if dest.exists() and dest.stat().st_mtime >= img_path.stat().st_mtime:
+            resized.append(dest)
+            source_map[dest] = img_path
+            reused += 1
+        else:
+            to_resize.append((img_path, dest))
 
-            with Image.open(img_path) as img:
-                # Handle EXIF rotation
-                from PIL import ImageOps
+    # Parallel resize
+    if to_resize:
+        n_workers = min(len(to_resize), os.cpu_count() or 4)
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for result in pool.map(_resize_one_image, to_resize):
+                if result is not None:
+                    dest, img_path = result
+                    resized.append(dest)
+                    source_map[dest] = img_path
+                else:
+                    print("  ⚠ Skipping an image: resize failed")
 
-                img = ImageOps.exif_transpose(img)
-
-                # Convert to RGB if needed (handles RGBA, P mode, etc.)
-                if img.mode not in ("RGB", "L"):
-                    img = img.convert("RGB")
-
-                w, h = img.size
-                longest = max(w, h)
-
-                if longest > MAX_RESIZE_PX:
-                    scale = MAX_RESIZE_PX / longest
-                    new_size = (int(w * scale), int(h * scale))
-                    img = img.resize(new_size, Image.LANCZOS)
-
-                img.save(dest, "JPEG", quality=90)
-                resized.append(dest)
-                source_map[dest] = img_path
-        except Exception as e:
-            print(f"  ⚠ Skipping {img_path.name}: {e}")
+    # Sort to maintain deterministic order
+    resized.sort(key=lambda p: p.name)
 
     newly_resized = len(resized) - reused
     print(
         f"  ✅ Prepared {len(resized)} images (new: {newly_resized}, reused: {reused})"
-        f" to max {MAX_RESIZE_PX}px → {work_folder}"
+        f" to max {MAX_RESIZE_PX}px → {work_folder} ({os.cpu_count() or '?'} cores)"
     )
     return resized, source_map
 
@@ -615,7 +648,10 @@ def resize_for_processing(
 
 
 HIST_DEDUP_THRESHOLD = 0.92  # histogram correlation; higher = stricter
+HIST_DEDUP_TEMPORAL_THRESHOLD = 0.80  # relaxed threshold when EXIF timestamps are close
 HIST_DEDUP_THUMB_SIZE = (256, 256)
+BURST_MAX_INTERVAL_SEC = 3.0  # max seconds between shots to consider them a burst
+ORB_MATCH_THRESHOLD = 0.25  # minimum ORB good-match ratio to confirm burst membership
 
 
 def _image_histogram(img_path: Path) -> Optional[np.ndarray]:
@@ -632,72 +668,227 @@ def _image_histogram(img_path: Path) -> Optional[np.ndarray]:
         return None
 
 
-def deduplicate(images: list[Path], threshold: int = DEDUP_THRESHOLD) -> list[Path]:
-    """
-    Remove near-duplicate images using perceptual hashing,
-    then a second pass using histogram correlation to catch burst shots
-    with shifted framing that hash-dedup misses.
-    Returns one representative from each group of similar images.
-    """
-    import imagehash
+def _exif_timestamp(img_path: Path) -> Optional[float]:
+    """Extract EXIF DateTimeOriginal as epoch seconds, or None."""
+    try:
+        from PIL.ExifTags import TAGS as _TAGS
+        with Image.open(img_path) as img:
+            raw = img._getexif()
+            if not raw:
+                return None
+            tagged = {_TAGS.get(k, k): v for k, v in raw.items()}
+            dt_str = tagged.get("DateTimeOriginal") or tagged.get("DateTime")
+            if not dt_str:
+                return None
+            # Handle optional subsecond precision
+            subsec = tagged.get("SubSecTimeOriginal") or tagged.get("SubSecTime") or "0"
+            from datetime import datetime
+            dt = datetime.strptime(str(dt_str), "%Y:%m:%d %H:%M:%S")
+            return dt.timestamp() + float(f"0.{subsec}")
+    except Exception:
+        return None
 
-    # Pass 1: perceptual hash dedup
-    hash_groups: dict[imagehash.ImageHash, list[Path]] = {}
 
+def _quick_sharpness(img_path: Path) -> float:
+    """Quick Laplacian variance sharpness score for burst selection."""
+    try:
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return 0.0
+        return float(cv2.Laplacian(img, cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
+def _compute_phash(img_path: Path) -> Optional[tuple[Path, object]]:
+    """Compute perceptual hash for one image. For ProcessPoolExecutor."""
+    try:
+        import imagehash
+        h = imagehash.phash(Image.open(img_path), hash_size=16)
+        return (img_path, h)
+    except Exception:
+        return None
+
+
+def _compute_orb_descriptors(img_path: Path) -> Optional[np.ndarray]:
+    """Compute ORB descriptors for burst verification."""
+    try:
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return None
+        thumb = cv2.resize(img, (512, 512))
+        gray = cv2.cvtColor(thumb, cv2.COLOR_BGR2GRAY)
+        orb = cv2.ORB_create(500)
+        _, descriptors = orb.detectAndCompute(gray, None)
+        return descriptors
+    except Exception:
+        return None
+
+
+def _orb_match_ratio(desc_a: Optional[np.ndarray], desc_b: Optional[np.ndarray]) -> float:
+    """Compute ORB good-match ratio between two descriptor sets."""
+    if desc_a is None or desc_b is None:
+        return 0.0
+    try:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(desc_a, desc_b)
+        if not matches:
+            return 0.0
+        good = [m for m in matches if m.distance < 50]
+        return len(good) / len(matches)
+    except Exception:
+        return 0.0
+
+
+def _compute_dedup_features(img_path: Path) -> tuple[Path, Optional[np.ndarray], Optional[float], float, Optional[np.ndarray]]:
+    """Compute histogram, EXIF timestamp, sharpness, and ORB descriptors for one image."""
+    hist = _image_histogram(img_path)
+    ts = _exif_timestamp(img_path)
+    sharpness = _quick_sharpness(img_path)
+    orb_desc = _compute_orb_descriptors(img_path)
+    return (img_path, hist, ts, sharpness, orb_desc)
+
+
+def deduplicate(
+    images: list[Path], threshold: int = DEDUP_THRESHOLD
+) -> tuple[list[Path], dict[Path, list[Path]]]:
+    """
+    Remove near-duplicate images using:
+    1. Perceptual hashing for pixel-identical duplicates.
+    2. Histogram correlation + EXIF temporal proximity for burst shots.
+       Images taken within BURST_MAX_INTERVAL_SEC use a relaxed histogram
+       threshold; others use the strict threshold.
+
+    Per-image feature computation (hashing, histograms, EXIF, sharpness) is
+    parallelized across CPU cores. Grouping logic remains sequential.
+
+    Returns (unique_images, burst_map) where burst_map maps each
+    representative to the full list of burst members (only for groups > 1).
+    Initial representative is selected by sharpness (Laplacian variance).
+    """
+    from concurrent.futures import ProcessPoolExecutor
+
+    n_workers = min(len(images), os.cpu_count() or 4)
+
+    # Pass 1: compute perceptual hashes in parallel
+    path_hash_map: dict[Path, object] = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for result in pool.map(_compute_phash, images):
+            if result is not None:
+                img_path, h = result
+                path_hash_map[img_path] = h
+            else:
+                print("  ⚠ Hash failed for an image")
+
+    # Sequential grouping by hash distance
+    hash_groups: dict[object, list[Path]] = {}
     for img_path in images:
-        try:
-            h = imagehash.phash(Image.open(img_path), hash_size=16)
-            placed = False
-            for existing_hash, group in hash_groups.items():
-                if abs(h - existing_hash) <= threshold:
-                    group.append(img_path)
-                    placed = True
-                    break
-            if not placed:
-                hash_groups[h] = [img_path]
-        except Exception as e:
-            print(f"  ⚠ Hash failed for {img_path.name}: {e}")
+        h = path_hash_map.get(img_path)
+        if h is None:
+            continue
+        placed = False
+        for existing_hash, group in hash_groups.items():
+            if abs(h - existing_hash) <= threshold:
+                group.append(img_path)
+                placed = True
+                break
+        if not placed:
+            hash_groups[h] = [img_path]
 
-    # From each group, pick the largest file (usually highest quality)
+    # Compute sharpness in parallel for hash groups with >1 member
+    sharpness_cache: dict[Path, float] = {}
+    multi_groups = [g for g in hash_groups.values() if len(g) > 1]
+    if multi_groups:
+        all_multi = [p for g in multi_groups for p in g]
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for path, sharpness in zip(all_multi, pool.map(_quick_sharpness, all_multi)):
+                sharpness_cache[path] = sharpness
+
+    # From each hash group, pick sharpest
     hash_unique = []
     hash_removed = 0
     for group in hash_groups.values():
-        best = max(group, key=lambda p: p.stat().st_size)
+        if len(group) == 1:
+            best = group[0]
+        else:
+            best = max(group, key=lambda p: sharpness_cache.get(p, 0.0))
         hash_unique.append(best)
         hash_removed += len(group) - 1
 
-    # Pass 2: histogram correlation to catch burst shots
-    hist_groups: list[list[tuple[Path, np.ndarray]]] = []
-    for img_path in hash_unique:
-        hist = _image_histogram(img_path)
+    # Pass 2: compute histogram + EXIF + sharpness in parallel for burst detection
+    img_data: list[tuple[Path, Optional[np.ndarray], Optional[float], float]] = []
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        img_data = list(pool.map(_compute_dedup_features, hash_unique))
+
+    # Sort by timestamp so temporal chaining works naturally
+    img_data.sort(key=lambda e: e[2] if e[2] is not None else float("inf"))
+
+    raw_burst_groups: list[list[tuple[Path, Optional[np.ndarray], Optional[float], float, Optional[np.ndarray]]]] = []
+    for entry in img_data:
+        img_path, hist, ts, sharpness, orb_desc = entry
         if hist is None:
-            hist_groups.append([(img_path, np.array([]))])
+            raw_burst_groups.append([entry])
             continue
         placed = False
-        for group in hist_groups:
-            ref_hist = group[0][1]
-            if ref_hist.size > 0:
-                corr = cv2.compareHist(ref_hist, hist, cv2.HISTCMP_CORREL)
-                if corr >= HIST_DEDUP_THRESHOLD:
-                    group.append((img_path, hist))
-                    placed = True
-                    break
+        for group in raw_burst_groups:
+            last_path, last_hist, last_ts, _, last_orb = group[-1]
+            first_path, first_hist, first_ts, _, first_orb = group[0]
+
+            # Must be temporally close to the last member (chaining)
+            if ts is not None and last_ts is not None:
+                time_to_last = abs(ts - last_ts)
+                if time_to_last > BURST_MAX_INTERVAL_SEC:
+                    continue
+            elif ts is not None or last_ts is not None:
+                continue
+
+            # Must be visually similar (histogram) to the chain tail
+            if last_hist is None or last_hist.size == 0:
+                continue
+            corr_last = cv2.compareHist(last_hist, hist, cv2.HISTCMP_CORREL)
+            is_temporal = (ts is not None and last_ts is not None and time_to_last <= BURST_MAX_INTERVAL_SEC)
+
+            # ORB verification: confirm the subject matches, not just the scene
+            orb_ratio = _orb_match_ratio(last_orb, orb_desc)
+
+            if is_temporal and orb_ratio >= ORB_MATCH_THRESHOLD:
+                # Strong ORB match + temporal proximity: very lenient histogram
+                # (exposure can shift between burst frames)
+                if corr_last < 0.60:
+                    continue
+            elif is_temporal:
+                if corr_last < HIST_DEDUP_TEMPORAL_THRESHOLD:
+                    continue
+                if orb_ratio < ORB_MATCH_THRESHOLD:
+                    continue
+            else:
+                if corr_last < HIST_DEDUP_THRESHOLD:
+                    continue
+                if orb_ratio < ORB_MATCH_THRESHOLD:
+                    continue
+
+            group.append(entry)
+            placed = True
+            break
         if not placed:
-            hist_groups.append([(img_path, hist)])
+            raw_burst_groups.append([entry])
 
     unique = []
-    hist_removed = 0
-    for group in hist_groups:
-        paths = [p for p, _ in group]
-        best = max(paths, key=lambda p: p.stat().st_size)
-        unique.append(best)
-        hist_removed += len(group) - 1
+    burst_map: dict[Path, list[Path]] = {}
+    burst_removed = 0
+    for group in raw_burst_groups:
+        best_path = max(group, key=lambda e: e[3])[0]
+        paths = [p for p, _, _, _, _ in group]
+        unique.append(best_path)
+        if len(paths) > 1:
+            burst_map[best_path] = paths
+        burst_removed += len(group) - 1
 
     print(
         f"  ✅ Dedup: {len(images)} → {len(unique)} unique "
-        f"({hash_removed} hash dupes, {hist_removed} burst dupes removed)"
+        f"({hash_removed} hash dupes, {burst_removed} burst dupes removed)"
     )
-    return unique
+    return unique, burst_map
 
 
 # ---------------------------------------------------------------------------
@@ -1045,30 +1236,65 @@ def _save_tech_cache(img_path: Path, tech: dict) -> None:
         pass
 
 
+def _score_technical_with_cache(img_path: Path) -> Optional[tuple[Path, dict]]:
+    """Score one image technically, with cache. For use in ProcessPoolExecutor."""
+    try:
+        cached = _load_tech_cache(img_path)
+        if cached is not None:
+            return (img_path, cached)
+        tech = score_technical(img_path)
+        _save_tech_cache(img_path, tech)
+        return (img_path, tech)
+    except Exception:
+        return None
+
+
 def batch_technical_score(
     images: list[Path], source_map: Optional[dict[Path, Path]] = None
 ) -> list[ImageScore]:
-    """Score all images technically and return sorted list."""
+    """Score all images technically using multiple threads and return sorted list."""
+    from concurrent.futures import ThreadPoolExecutor
+
     results = []
     cache_hits = 0
+
+    # Split cached vs uncached
+    cached_results: list[tuple[Path, dict]] = []
+    to_score: list[Path] = []
     for img_path in images:
-        try:
-            cached = _load_tech_cache(img_path)
-            if cached is not None:
-                tech = cached
-                cache_hits += 1
-            else:
-                tech = score_technical(img_path)
-                _save_tech_cache(img_path, tech)
-            results.append(
-                ImageScore(
-                    path=img_path,
-                    source_path=source_map.get(img_path) if source_map else None,
-                    technical=tech,
-                )
+        cached = _load_tech_cache(img_path)
+        if cached is not None:
+            cached_results.append((img_path, cached))
+            cache_hits += 1
+        else:
+            to_score.append(img_path)
+
+    # Add cached results
+    for img_path, tech in cached_results:
+        results.append(
+            ImageScore(
+                path=img_path,
+                source_path=source_map.get(img_path) if source_map else None,
+                technical=tech,
             )
-        except Exception as e:
-            print(f"  ⚠ Tech score failed for {img_path.name}: {e}")
+        )
+
+    # Parallel score uncached (ThreadPool — YOLO/OpenCV release GIL, avoids fork deadlocks)
+    if to_score:
+        n_workers = min(len(to_score), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for result in pool.map(_score_technical_with_cache, to_score):
+                if result is not None:
+                    img_path, tech = result
+                    results.append(
+                        ImageScore(
+                            path=img_path,
+                            source_path=source_map.get(img_path) if source_map else None,
+                            technical=tech,
+                        )
+                    )
+                else:
+                    print("  ⚠ Tech score failed for an image")
 
     results.sort(key=lambda x: x.technical.get("composite", 0), reverse=True)
     print(
@@ -1115,9 +1341,10 @@ Rate each criterion 1-10 using these professional composition guidelines:
    - Would cropping to portrait cut off wheels, handlebars, or exhaust?
    - Would the subject remain well-composed in Instagram's 3:4 grid thumbnail?
 
-BRAND PRIORITY: This is a Ducati-focused account. If the motorcycle is identifiably NOT a Ducati
-(e.g. Japanese brands, BMW, KTM, Harley, etc.), reduce SUBJECT_CLARITY and EMOTION scores by 3
-points each (minimum 1). Ducati bikes or unidentifiable brands score normally.
+BRAND BONUS: This is a Ducati-focused account. If you can identify the motorcycle as a Ducati
+(by logo, livery, bodywork shape, or distinctive features like trellis frame, desmo, Panigale
+fairings, etc.), add 2 bonus points to SUBJECT_CLARITY and EMOTION (max 10 each).
+All other brands or unidentifiable bikes score normally — do NOT penalize them.
 
 Return ONLY valid JSON, no markdown:
 {{"subject_clarity": N, "lighting": N, "color_pop": N, "emotion": N, "scroll_stop": N, "crop_4x5": N, "total": N, "one_line": "why this works or doesn't"}}"""
@@ -1140,7 +1367,7 @@ Rules:
 - Score each criterion as an integer from 0 to 10.
 - total must equal the sum of the 6 criterion scores (0 to 60).
 - one_line must be exactly one concise sentence describing this specific image.
-- BRAND PRIORITY: This is a Ducati-focused account. If the motorcycle is identifiably NOT a Ducati (e.g. Japanese brands, BMW, KTM, Harley, etc.), reduce subject_clarity and emotion by 3 each (minimum 1). Ducati or unidentifiable brands score normally.
+- BRAND BONUS: This is a Ducati-focused account. If the motorcycle is identifiably a Ducati, add 2 bonus points to subject_clarity and emotion (max 10 each). All other brands or unidentifiable bikes score normally — do NOT penalize them.
 """
 
 OLLAMA_STRICT_JSON_SCHEMA = {
@@ -2002,83 +2229,181 @@ def batch_vision_score(
 
     scored = 0
     failed = 0
-    score_iter = candidates
-    progress_write = print
     active_claude_model = claude_model_used or resolve_claude_model(cli_model=claude_model)
+
     if scorer == "claude":
+        # --- Adaptive concurrent Claude scoring ---
+        CLAUDE_INITIAL_CONCURRENCY = 3
+        CLAUDE_MAX_CONCURRENCY = 8
+        CLAUDE_MIN_CONCURRENCY = 1
+        CLAUDE_MAX_RETRIES = 3
+        CLAUDE_RETRY_BASE_SEC = 1.0
+
+        concurrency = CLAUDE_INITIAL_CONCURRENCY
+        rate_limit_hits = 0
+        progress_bar = None
+        progress_write = print
         try:
             from tqdm.auto import tqdm
-
-            score_iter = tqdm(
-                candidates,
-                total=len(candidates),
-                desc=f"  {scorer.capitalize()} scoring",
-                unit="img",
+            progress_bar = tqdm(
+                total=len(candidates), desc="  Claude scoring", unit="img",
             )
             progress_write = tqdm.write
-        except Exception as e:
-            print(f"  ⚠ Progress bar unavailable: {e}")
+        except Exception:
+            pass
 
-    for item in score_iter:
-        try:
-            if scorer == "claude":
-                source_for_cache = item.source_path or item.path
-                source_sha256 = _file_sha256(source_for_cache)
-                cached = None if rescore else load_claude_score_from_file_cache(
+        def _is_rate_limit(e: Exception) -> bool:
+            text = str(e).lower()
+            return "429" in text or "rate" in text or "overloaded" in text or "529" in text
+
+        def _claude_score_one(item: ImageScore) -> tuple[ImageScore, Optional[dict], Optional[Exception], bool]:
+            """Score one image with Claude. Returns (item, vision_dict, error, was_cached)."""
+            source_for_cache = item.source_path or item.path
+            source_sha = _file_sha256(source_for_cache)
+            if not rescore:
+                cached = load_claude_score_from_file_cache(
                     source_path=source_for_cache,
-                    source_sha256=source_sha256,
+                    source_sha256=source_sha,
                     model=active_claude_model,
                     prompt_sha256=claude_prompt_hash,
                     strict_model=False,
                 )
                 if cached is not None:
-                    item.vision = cached
-                    claude_cache_hits += 1
-                else:
-                    item.vision = score_with_claude(
-                        item.path,
-                        api_key=claude_api_key,
+                    return (item, cached, None, True)
+            try:
+                vision = score_with_claude(
+                    item.path,
+                    api_key=claude_api_key,
+                    model=active_claude_model,
+                    client=claude_client,
+                    use_yolo_context=True,
+                    prompt=claude_base_prompt,
+                )
+                try:
+                    save_claude_score_to_file_cache(
+                        source_path=source_for_cache,
+                        source_sha256=source_sha,
                         model=active_claude_model,
-                        client=claude_client,
-                        use_yolo_context=True,  # Enable YOLO context for Claude scoring
-                        prompt=claude_base_prompt,
+                        prompt_sha256=claude_prompt_hash,
+                        vision=vision,
                     )
-                    try:
-                        save_claude_score_to_file_cache(
-                            source_path=source_for_cache,
-                            source_sha256=source_sha256,
-                            model=active_claude_model,
-                            prompt_sha256=claude_prompt_hash,
-                            vision=item.vision,
-                        )
-                    except Exception as e:
-                        progress_write(
-                            f"  ⚠ Could not write cache for {source_for_cache.name}: {e}"
-                        )
-                    claude_api_calls += 1
-            else:
-                item.vision = score_with_clip(item.path, clip_model, clip_processor)
+                except Exception:
+                    pass
+                return (item, vision, None, False)
+            except Exception as e:
+                return (item, None, e, False)
 
-            # Final composite: 30% technical + 70% vision
-            vision_normalized = item.vision.get("total", 30) / 60.0
+        def _finalize(item: ImageScore, vision: dict) -> None:
+            item.vision = vision
+            vision_normalized = vision.get("total", 30) / 60.0
             base_score = item.technical["composite"] * 0.3 + vision_normalized * 0.7
-            if scorer == "claude":
-                gate = _claude_crop_gate_multiplier(item.vision)
-                item.final_score = base_score * gate
-            else:
-                item.final_score = base_score
-            item.one_line = item.vision.get("one_line", "")
-            scored += 1
-        except Exception as e:
-            progress_write(f"  ⚠ Vision score failed for {item.path.name}: {e}")
-            item.final_score = item.technical["composite"] * 0.3
-            item.one_line = "Vision scoring failed — ranked by technical score only"
-            failed += 1
+            gate = _claude_crop_gate_multiplier(vision)
+            item.final_score = base_score * gate
+            item.one_line = vision.get("one_line", "")
 
-    if scorer == "claude" and hasattr(score_iter, "close"):
-        score_iter.close()
-    if scorer == "claude":
-        print(f"  📦 Claude cache hits: {claude_cache_hits} | API calls: {claude_api_calls}")
+        pending: dict = {}
+        next_idx = 0
+        retry_queue: list[tuple[ImageScore, int]] = []  # (item, attempt)
+
+        with ThreadPoolExecutor(max_workers=CLAUDE_MAX_CONCURRENCY) as executor:
+            # Fill initial batch
+            while next_idx < len(candidates) and len(pending) < concurrency:
+                future = executor.submit(_claude_score_one, candidates[next_idx])
+                pending[future] = (candidates[next_idx], 0)
+                next_idx += 1
+
+            while pending or retry_queue:
+                # Submit retries if we have capacity
+                while retry_queue and len(pending) < concurrency:
+                    retry_item, attempt = retry_queue.pop(0)
+                    future = executor.submit(_claude_score_one, retry_item)
+                    pending[future] = (retry_item, attempt)
+
+                if not pending:
+                    break
+
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    item, attempt = pending.pop(future)
+                    result_item, vision, error, was_cached = future.result()
+
+                    if vision is not None:
+                        _finalize(result_item, vision)
+                        if was_cached:
+                            claude_cache_hits += 1
+                        else:
+                            claude_api_calls += 1
+                        scored += 1
+                        # Scale up on success (slowly)
+                        if concurrency < CLAUDE_MAX_CONCURRENCY and claude_api_calls % 5 == 0:
+                            concurrency = min(concurrency + 1, CLAUDE_MAX_CONCURRENCY)
+                    elif error is not None:
+                        if _is_rate_limit(error) and attempt < CLAUDE_MAX_RETRIES:
+                            rate_limit_hits += 1
+                            # Back off: reduce concurrency and retry with delay
+                            concurrency = max(CLAUDE_MIN_CONCURRENCY, concurrency - 1)
+                            backoff = CLAUDE_RETRY_BASE_SEC * (2 ** attempt)
+                            progress_write(
+                                f"  ⏳ Rate limited, backing off {backoff:.1f}s "
+                                f"(concurrency → {concurrency})"
+                            )
+                            time.sleep(backoff)
+                            retry_queue.append((result_item, attempt + 1))
+                        elif attempt < CLAUDE_MAX_RETRIES and "timeout" in str(error).lower():
+                            retry_queue.append((result_item, attempt + 1))
+                        else:
+                            progress_write(
+                                f"  ⚠ Vision score failed for {result_item.path.name}: {error}"
+                            )
+                            result_item.final_score = result_item.technical["composite"] * 0.3
+                            result_item.one_line = "Vision scoring failed — ranked by technical score only"
+                            failed += 1
+
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+
+                    # Submit next items up to current concurrency
+                    while next_idx < len(candidates) and len(pending) < concurrency:
+                        future = executor.submit(_claude_score_one, candidates[next_idx])
+                        pending[future] = (candidates[next_idx], 0)
+                        next_idx += 1
+
+        if progress_bar is not None:
+            progress_bar.close()
+        print(
+            f"  📦 Claude: {claude_cache_hits} cached, {claude_api_calls} API calls, "
+            f"{failed} failed, {rate_limit_hits} rate limits, concurrency peak {concurrency}"
+        )
+
+    else:
+        # CLIP scoring (sequential, local)
+        progress_write = print
+        score_iter = candidates
+        try:
+            from tqdm.auto import tqdm
+            score_iter = tqdm(
+                candidates, total=len(candidates),
+                desc=f"  {scorer.capitalize()} scoring", unit="img",
+            )
+            progress_write = tqdm.write
+        except Exception:
+            pass
+
+        for item in score_iter:
+            try:
+                item.vision = score_with_clip(item.path, clip_model, clip_processor)
+                vision_normalized = item.vision.get("total", 30) / 60.0
+                item.final_score = item.technical["composite"] * 0.3 + vision_normalized * 0.7
+                item.one_line = item.vision.get("one_line", "")
+                scored += 1
+            except Exception as e:
+                progress_write(f"  ⚠ Vision score failed for {item.path.name}: {e}")
+                item.final_score = item.technical["composite"] * 0.3
+                item.one_line = "Vision scoring failed — ranked by technical score only"
+                failed += 1
+
+        if hasattr(score_iter, "close"):
+            score_iter.close()
 
     candidates.sort(key=lambda x: x.final_score, reverse=True)
     print(f"  ✅ Vision scoring: {scored} scored, {failed} failed")
@@ -3163,6 +3488,27 @@ def _prepare_claude_crop_first_candidates(
 # ---------------------------------------------------------------------------
 
 
+def _crop_one_image(args: tuple) -> tuple[int, dict]:
+    """Smart-crop one image for Stage 4. Module-level for ProcessPoolExecutor pickling."""
+    idx, src_path, dest_path = args
+    meta: dict[str, object] = {}
+    try:
+        smart_crop(src_path, dest_path, save_debug=True, meta_out=meta)
+    except Exception:
+        try:
+            with Image.open(src_path) as img:
+                img = img.convert("RGB")
+                img = img.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.LANCZOS)
+                img.save(dest_path, "JPEG", quality=95)
+            meta = {
+                "uncertain_crop": True,
+                "uncertain_crop_reasons": ["smart_crop_failed_used_center_resize_fallback"],
+            }
+        except Exception:
+            meta = {"_failed": True}
+    return (idx, meta)
+
+
 def run_pipeline(
     input_folder: str,
     output_folder: str = "selected",
@@ -3215,11 +3561,61 @@ def run_pipeline(
 
     # --- Stage 1: Deduplicate ---
     print("\n🔍 Stage 1: Deduplicating...")
-    unique = deduplicate(resized)
+    unique, burst_map = deduplicate(resized)
 
     # --- Stage 2: Technical scoring ---
     print("\n📊 Stage 2: Technical quality scoring...")
     scored = batch_technical_score(unique, source_map=source_map)
+
+    # Tag burst groups on scored items
+    for item in scored:
+        if item.path in burst_map:
+            item.burst_group = burst_map[item.path]
+            item.burst_selected_by = "sharpness"
+
+    # --- Stage 2b: Re-evaluate bursts for top candidates ---
+    # For images selected from a burst, score all burst members technically
+    # in parallel and swap in the best one if different from the sharpness pick.
+    n_reeval = max(top_n * 2, int(len(scored) * 0.5))
+    burst_items = [item for item in scored[:n_reeval] if item.burst_group and len(item.burst_group) >= 2]
+    burst_swaps = 0
+    if burst_items:
+        from concurrent.futures import ThreadPoolExecutor as _TPE2b
+        # Collect all alt paths that need scoring (exclude already-scored representative)
+        alt_paths: list[Path] = []
+        for item in burst_items:
+            for p in item.burst_group:
+                if p != item.path:
+                    alt_paths.append(p)
+        # Score them all in parallel (ThreadPool — avoids YOLO fork deadlocks)
+        alt_scores: dict[Path, dict] = {}
+        if alt_paths:
+            n_workers = min(len(alt_paths), os.cpu_count() or 4)
+            with _TPE2b(max_workers=n_workers) as pool:
+                for result in zip(alt_paths, pool.map(_score_technical_with_cache, alt_paths)):
+                    path, res = result
+                    if res is not None:
+                        alt_scores[res[0]] = res[1]
+        # Pick the best from each burst group
+        for item in burst_items:
+            best_path = item.path
+            best_composite = item.technical.get("composite", 0)
+            for alt_path in item.burst_group:
+                if alt_path == item.path:
+                    continue
+                alt_tech = alt_scores.get(alt_path)
+                if alt_tech and alt_tech.get("composite", 0) > best_composite:
+                    best_composite = alt_tech["composite"]
+                    best_path = alt_path
+            if best_path != item.path:
+                item.path = best_path
+                item.source_path = source_map.get(best_path, item.source_path)
+                item.technical = alt_scores.get(best_path, item.technical)
+                item.burst_selected_by = "technical"
+                burst_swaps += 1
+    if burst_swaps:
+        print(f"  🔄 Burst re-evaluation: swapped {burst_swaps} images for better technical scores")
+        scored.sort(key=lambda x: x.technical.get("composite", 0), reverse=True)
 
     # --- Stage 3: Vision scoring ---
     if score_all:
@@ -3239,7 +3635,7 @@ def run_pipeline(
         if rescore:
             uncached = len(candidates)
         else:
-            claude_est_prompt = build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
+            claude_est_prompt = build_vision_prompt(resolve_account_context(search_dir=src))
             claude_est_hash = claude_prompt_sha256(claude_est_prompt)
             claude_est_model = claude_model or resolve_claude_model()
             uncached = 0
@@ -3297,35 +3693,49 @@ def run_pipeline(
     else:
         top = ranked[:top_n]
 
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor as _TPE4
+
+    # Prepare output paths for each ranked image
+    output_plan: list[dict] = []
     for i, item in enumerate(top):
         rank = i + 1
         output_stem = (item.source_path or item.path).stem
-        dest_cropped = out / f"{rank:02d}_cropped_{output_stem}.jpg"
-        dest_hd = out / f"{rank:02d}_hd_{output_stem}.jpg"
-        dest_full = out / f"{rank:02d}_full_{output_stem}{(item.source_path or item.path).suffix}"
-        display_name = (item.source_path or item.path).name
-        padded_written = False
-        crop_meta: dict[str, object] = {}
+        output_plan.append({
+            "rank": rank,
+            "item": item,
+            "dest_cropped": out / f"{rank:02d}_cropped_{output_stem}.jpg",
+            "dest_hd": out / f"{rank:02d}_hd_{output_stem}.jpg",
+            "dest_full": out / f"{rank:02d}_full_{output_stem}{(item.source_path or item.path).suffix}",
+            "display_name": (item.source_path or item.path).name,
+        })
 
-        # Cropped: IG 1080x1440 smart crop
-        try:
-            smart_crop(item.path, dest_cropped, save_debug=True, meta_out=crop_meta)
-        except Exception:
-            try:
-                with Image.open(item.path) as img:
-                    img = img.convert("RGB")
-                    img = img.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.LANCZOS)
-                    img.save(dest_cropped, "JPEG", quality=95)
-                crop_meta = {
-                    "uncertain_crop": True,
-                    "uncertain_crop_reasons": ["smart_crop_failed_used_center_resize_fallback"],
-                }
-            except Exception as e2:
-                print(f"  ⚠ Could not process {item.path.name}: {e2}")
-                continue
+    crop_args = [
+        (i, plan["item"].path, plan["dest_cropped"])
+        for i, plan in enumerate(output_plan)
+    ]
+    crop_results: dict[int, dict] = {}
+    n_crop_workers = min(len(crop_args), os.cpu_count() or 4)
+    with _TPE4(max_workers=n_crop_workers) as pool:
+        for idx, meta in pool.map(_crop_one_image, crop_args):
+            crop_results[idx] = meta
+
+    # Sequential: file copies + report assembly (fast I/O, needs ordering)
+    for i, plan in enumerate(output_plan):
+        item = plan["item"]
+        rank = plan["rank"]
+        dest_cropped = plan["dest_cropped"]
+        dest_hd = plan["dest_hd"]
+        dest_full = plan["dest_full"]
+        display_name = plan["display_name"]
+        crop_meta = crop_results.get(i, {})
+        padded_written = False
+
+        if crop_meta.get("_failed"):
+            print(f"  ⚠ Could not process {item.path.name}")
+            continue
 
         # HD: 1920px longest edge (work copy)
-        import shutil
         try:
             shutil.copy2(str(item.path), str(dest_hd))
         except Exception as e3:
@@ -3338,6 +3748,14 @@ def run_pipeline(
             padded_written = True
         except Exception as e3:
             print(f"  ⚠ Could not copy full version for {display_name}: {e3}")
+
+        burst_info = None
+        if item.burst_group and len(item.burst_group) > 1:
+            burst_info = {
+                "count": len(item.burst_group),
+                "selected_by": item.burst_selected_by,
+                "members": [p.name for p in item.burst_group],
+            }
 
         report.append(
             {
@@ -3352,6 +3770,7 @@ def run_pipeline(
                 "output_full": dest_full.name if padded_written else None,
                 "uncertain_crop": bool(crop_meta.get("uncertain_crop", False)),
                 "uncertain_crop_reasons": crop_meta.get("uncertain_crop_reasons", []),
+                "burst": burst_info,
             }
         )
 
@@ -3376,14 +3795,784 @@ def run_pipeline(
         analyzed_items=ranked,
     )
 
+    # Generate HTML gallery
+    gallery_path = generate_gallery(out, src)
+
     print(f"\n{'=' * 60}")
     print(f"🏆 Done! {len(top)} images saved to {out}/")
     print(f"🗂️  Work folder retained: {work}")
     print(f"📋 JSON Report: {report_json_path}")
     print(f"📝 Markdown Report: {report_md_path}")
+    if gallery_path:
+        print(f"🌐 Gallery: {gallery_path}")
     print(f"{'=' * 60}")
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# HTML Gallery
+# ---------------------------------------------------------------------------
+
+_GALLERY_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{
+    --bg: #0f0f0f;
+    --surface: #1a1a1a;
+    --surface2: #242424;
+    --border: #333;
+    --text: #e0e0e0;
+    --text-dim: #888;
+    --accent: #d32f2f;
+    --accent-dim: #b71c1c;
+    --gold: #ffd54f;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.5;
+  }}
+  header {{
+    padding: 1rem 2rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }}
+  header {{
+    padding: 1rem 2rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }}
+  header h1 {{
+    font-size: 1.3rem; font-weight: 600;
+    display: flex; align-items: center; gap: .5rem;
+  }}
+  header h1 span {{ color: var(--accent); }}
+  .gh-link {{
+    color: var(--text-dim); transition: color .15s;
+  }}
+  .gh-link:hover {{ color: var(--text); }}
+  .breadcrumb {{ display: inline; font-size: .85rem; color: var(--text-dim); }}
+  .breadcrumb a {{ color: var(--text-dim); text-decoration: none; }}
+  .breadcrumb a:hover {{ color: var(--text); text-decoration: underline; }}
+  .breadcrumb .sep {{ margin: 0 .3rem; }}
+  .summary {{
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }}
+  .summary-toggle {{
+    display: block; width: 100%; padding: .5rem 2rem;
+    background: none; border: none; color: var(--text-dim);
+    font-size: .8rem; cursor: pointer; text-align: left;
+  }}
+  .summary-toggle:hover {{ color: var(--text); }}
+  .summary-body {{
+    display: none; padding: 0 2rem .75rem;
+  }}
+  .summary.open .summary-body {{ display: block; }}
+  .summary-grid {{
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: .5rem;
+  }}
+  .stat {{ background: var(--surface2); border-radius: 6px; padding: .4rem .6rem; }}
+  .stat-label {{ font-size: .65rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .05em; }}
+  .stat-value {{ font-size: 1rem; font-weight: 600; }}
+  .layout {{
+    display: flex; height: calc(100vh - 85px);
+  }}
+  .grid-panel {{
+    flex: 1; overflow-y: auto; padding: .75rem;
+  }}
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: .5rem;
+  }}
+  .tile {{
+    position: relative; cursor: pointer;
+    border-radius: 6px; overflow: hidden;
+    border: 2px solid transparent;
+    transition: border-color .15s, transform .15s;
+  }}
+  .tile:hover {{ border-color: var(--accent); transform: scale(1.02); }}
+  .tile.active {{ border-color: var(--gold); }}
+  .tile img {{
+    width: 100%; aspect-ratio: 3/4; object-fit: cover; display: block;
+  }}
+  .tile-rank {{
+    position: absolute; top: 4px; left: 4px;
+    background: rgba(0,0,0,.75); color: var(--gold);
+    font-size: .7rem; font-weight: 700;
+    padding: 1px 6px; border-radius: 4px;
+  }}
+  .tile-score {{
+    position: absolute; bottom: 4px; right: 4px;
+    background: rgba(0,0,0,.75); color: var(--text);
+    font-size: .65rem; padding: 1px 5px; border-radius: 4px;
+  }}
+  .tile-uncertain {{
+    position: absolute; top: 4px; right: 4px;
+    background: rgba(0,0,0,.75); color: #ff9800;
+    font-size: .8rem; padding: 1px 5px; border-radius: 4px;
+  }}
+  .tile-burst {{
+    position: absolute; bottom: 4px; left: 4px;
+    background: rgba(0,0,0,.75); color: #81d4fa;
+    font-size: .6rem; padding: 1px 5px; border-radius: 4px;
+  }}
+  .detail-panel {{
+    width: 520px; min-width: 520px;
+    overflow-y: auto; background: var(--surface);
+    border-left: 1px solid var(--border);
+    padding: 1rem;
+    display: none;
+  }}
+  .detail-panel.open {{ display: flex; flex-direction: column; }}
+  .detail-panel h2 {{
+    font-size: .9rem; font-weight: 600; margin-bottom: .5rem;
+    word-break: break-all; flex-shrink: 0;
+  }}
+  .preview-row {{
+    display: flex; gap: .75rem;
+    flex: 1; min-height: 0; align-items: flex-start;
+  }}
+  .preview-col {{
+    flex: 1; display: flex; flex-direction: column;
+  }}
+  .preview-col h3 {{
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--text-dim); margin-bottom: .3rem; flex-shrink: 0;
+  }}
+  .version-tabs {{
+    display: flex; gap: 3px; margin-bottom: .4rem; flex-shrink: 0;
+  }}
+  .version-tabs button {{
+    flex: 1; padding: .25rem; font-size: .7rem;
+    background: var(--surface2); color: var(--text-dim);
+    border: 1px solid var(--border); border-radius: 4px;
+    cursor: pointer;
+  }}
+  .version-tabs button.active {{
+    background: var(--accent-dim); color: #fff; border-color: var(--accent);
+  }}
+  .preview-img-wrap {{
+    min-height: 0; display: flex; align-items: flex-start;
+  }}
+  .preview-img-wrap img {{
+    width: 100%; object-fit: contain;
+    border-radius: 4px; background: var(--surface2);
+  }}
+  .info-strip {{
+    flex-shrink: 0; margin-top: .5rem;
+    display: flex; flex-direction: column; gap: .5rem;
+  }}
+  .info-strip h3 {{
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--text-dim); margin-bottom: .2rem;
+  }}
+  .one-line {{
+    font-style: italic; color: var(--text-dim);
+    font-size: .8rem; line-height: 1.3;
+  }}
+  .score-row {{
+    display: flex; align-items: center; gap: .4rem;
+    margin-bottom: .2rem; font-size: .75rem;
+  }}
+  .score-label {{ width: 85px; color: var(--text-dim); text-align: right; flex-shrink: 0; }}
+  .score-bar-bg {{
+    flex: 1; height: 12px; background: var(--surface2);
+    border-radius: 3px; overflow: hidden;
+  }}
+  .score-bar {{
+    height: 100%; border-radius: 3px;
+    background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+    transition: width .3s;
+  }}
+  .score-val {{ width: 26px; text-align: right; font-weight: 600; font-size: .75rem; }}
+  .yolo-grid {{
+    display: grid; grid-template-columns: 1fr 1fr; gap: .2rem .5rem;
+    font-size: .75rem;
+  }}
+  .yolo-grid dt {{ color: var(--text-dim); }}
+  .yolo-grid dd {{ font-weight: 500; }}
+  .exif-row {{
+    display: flex; flex-wrap: wrap; gap: .3rem .75rem;
+    font-size: .75rem; color: var(--text-dim);
+  }}
+  .exif-row span {{ white-space: nowrap; }}
+  .exif-val {{ color: var(--text); font-weight: 500; }}
+  ::-webkit-scrollbar {{ width: 6px; }}
+  ::-webkit-scrollbar-track {{ background: var(--bg); }}
+  ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>
+    <a class="gh-link" href="https://github.com/renatobo/pickinsta" target="_blank" title="pickinsta on GitHub">
+      <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
+    <span>pickinsta</span> {breadcrumb} {title}
+  </h1>
+</header>
+<div class="summary" id="summary">
+  <button class="summary-toggle" onclick="this.parentElement.classList.toggle('open')">
+    Summary &mdash; click to expand
+  </button>
+  <div class="summary-body">
+    <div class="summary-grid">
+      {summary_stats}
+    </div>
+  </div>
+</div>
+<div class="layout">
+  <div class="grid-panel">
+    <div class="grid" id="grid">
+      {tiles}
+    </div>
+  </div>
+  <div class="detail-panel" id="detail">
+    <h2 id="detail-title"></h2>
+    <div class="version-tabs" id="version-tabs"></div>
+    <div class="preview-row">
+      <div class="preview-col">
+        <h3>Preview</h3>
+        <div class="preview-img-wrap">
+          <a id="version-link" href="" target="_blank"><img id="version-img" src="" alt=""></a>
+        </div>
+      </div>
+      <div class="preview-col" id="yolo-col" style="display:none">
+        <h3>YOLO Detection</h3>
+        <div class="preview-img-wrap">
+          <img id="yolo-img" src="" alt="">
+        </div>
+        <div id="detail-yolo" style="margin-top:.4rem"></div>
+      </div>
+    </div>
+    <div class="info-strip">
+      <div id="burst-section" style="display:none">
+        <h3>Burst</h3>
+        <div id="detail-burst" class="exif-row"></div>
+      </div>
+      <div id="exif-section" style="display:none">
+        <h3>EXIF</h3>
+        <div id="detail-exif" class="exif-row"></div>
+      </div>
+      <div>
+        <h3>AI Assessment</h3>
+        <p class="one-line" id="detail-oneline"></p>
+      </div>
+      <div>
+        <h3>Scores</h3>
+        <div id="detail-scores"></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const DATA = {json_data};
+function selectImage(idx) {{
+  document.querySelectorAll('.tile').forEach(t => t.classList.remove('active'));
+  const tile = document.querySelector(`.tile[data-idx="${{idx}}"]`);
+  if (tile) tile.classList.add('active');
+  const panel = document.getElementById('detail');
+  panel.classList.add('open');
+  const d = DATA[idx];
+  document.getElementById('detail-title').textContent = `#${{d.rank}} ${{d.filename}}`;
+  document.getElementById('detail-oneline').textContent = d.one_line || '';
+  const tabs = document.getElementById('version-tabs');
+  const img = document.getElementById('version-img');
+  const link = document.getElementById('version-link');
+  const versions = [
+    ['Full', d.output_full],
+    ['HD', d.output_hd],
+    ['Cropped', d.output_cropped],
+  ].filter(v => v[1]);
+  tabs.innerHTML = '';
+  versions.forEach(([label, file], i) => {{
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.onclick = () => {{
+      img.src = file;
+      link.href = file;
+      tabs.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+    }};
+    if (i === 0) btn.classList.add('active');
+    tabs.appendChild(btn);
+  }});
+  if (versions.length) {{ img.src = versions[0][1]; link.href = versions[0][1]; }}
+  // YOLO column
+  const yoloCol = document.getElementById('yolo-col');
+  const yoloImg = document.getElementById('yolo-img');
+  const yoloDiv = document.getElementById('detail-yolo');
+  if (d.yolo_debug_img || d.yolo) {{
+    yoloCol.style.display = 'flex';
+    yoloImg.src = d.yolo_debug_img || '';
+    yoloImg.style.display = d.yolo_debug_img ? 'block' : 'none';
+    if (d.yolo) {{
+      const y = d.yolo;
+      let yhtml = '<dl class="yolo-grid">';
+      const fields = [
+        ['Class', y.class_name],
+        ['Conf', y.confidence ? (y.confidence * 100).toFixed(0) + '%' : '\u2014'],
+        ['Shot', y.shot_type],
+        ['Facing', y.facing],
+      ];
+      fields.forEach(([k,v]) => {{ yhtml += `<dt>${{k}}</dt><dd>${{v || '\u2014'}}</dd>`; }});
+      yhtml += '</dl>';
+      yoloDiv.innerHTML = yhtml;
+    }} else {{
+      yoloDiv.innerHTML = '';
+    }}
+  }} else {{
+    yoloCol.style.display = 'none';
+  }}
+  // Burst
+  const burstDiv = document.getElementById('detail-burst');
+  const burstSection = document.getElementById('burst-section');
+  if (d.burst && d.burst.count > 1) {{
+    burstSection.style.display = 'block';
+    burstDiv.innerHTML = `<span>Best of <span class="exif-val">${{d.burst.count}}</span> shots</span>`
+      + `<span>Selected by <span class="exif-val">${{d.burst.selected_by}}</span></span>`;
+  }} else {{
+    burstSection.style.display = 'none';
+  }}
+  // EXIF
+  const exifDiv = document.getElementById('detail-exif');
+  const exifSection = document.getElementById('exif-section');
+  if (d.exif && Object.keys(d.exif).length) {{
+    exifSection.style.display = 'block';
+    const fields = [
+      ['camera'], ['lens'], ['focal'], ['aperture'], ['shutter'], ['iso'], ['date']
+    ];
+    let ehtml = '';
+    fields.forEach(([k]) => {{
+      if (d.exif[k]) ehtml += `<span><span class="exif-val">${{d.exif[k]}}</span></span>`;
+    }});
+    exifDiv.innerHTML = ehtml;
+  }} else {{
+    exifSection.style.display = 'none';
+  }}
+  // Scores
+  const criteria = ['subject_clarity','lighting','color_pop','emotion','scroll_stop','crop_4x5'];
+  const scoresDiv = document.getElementById('detail-scores');
+  let html = '';
+  html += scoreBar('Final', d.final_score, 1, true);
+  html += scoreBar('Technical', d.technical_composite, 1, true);
+  html += scoreBar('Vision', d.vision_total, 60, false);
+  html += '<div style="height:4px"></div>';
+  if (d.vision_detail) {{
+    criteria.forEach(c => {{
+      if (d.vision_detail[c] !== undefined) {{
+        html += scoreBar(c.replace(/_/g,' '), d.vision_detail[c], 10, false);
+      }}
+    }});
+  }}
+  scoresDiv.innerHTML = html;
+}}
+function scoreBar(label, value, max, isFloat) {{
+  const pct = Math.min(100, (value / max) * 100);
+  const display = isFloat ? value.toFixed(3) : Math.round(value);
+  return `<div class="score-row">
+    <span class="score-label">${{label}}</span>
+    <div class="score-bar-bg"><div class="score-bar" style="width:${{pct}}%"></div></div>
+    <span class="score-val">${{display}}</span>
+  </div>`;
+}}
+if (DATA.length) selectImage(0);
+</script>
+</body>
+</html>
+"""
+
+
+def _gallery_build_data(output_folder: Path, input_folder: Optional[Path] = None) -> list[dict]:
+    """Build gallery data from a selection output folder."""
+    from urllib.parse import quote as _quote
+
+    report_path = output_folder / "selection_report.json"
+    if not report_path.exists():
+        return []
+
+    report_data = json.loads(report_path.read_text(encoding="utf-8"))
+
+    # Try to find input folder from markdown report if not provided
+    if input_folder is None:
+        md = output_folder / "selection_report.md"
+        if md.exists():
+            for line in md.read_text(encoding="utf-8").splitlines()[:10]:
+                if line.startswith("- Input:") and "`" in line:
+                    p = Path(line.split("`")[1])
+                    if p.exists():
+                        input_folder = p
+                        break
+
+    criteria = ["subject_clarity", "lighting", "color_pop", "emotion", "scroll_stop", "crop_4x5"]
+    data = []
+    for item in report_data:
+        cropped_name = item.get("output_cropped") or item.get("output", "")
+
+        # YOLO debug
+        yolo_json_path = output_folder / f"debug_yolo_{cropped_name}.json"
+        yolo = None
+        if yolo_json_path.exists():
+            try:
+                yolo = json.loads(yolo_json_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        yolo_debug_img = f"debug_yolo_{cropped_name}"
+        yolo_debug_exists = (output_folder / yolo_debug_img).exists()
+
+        # Vision detail from cache
+        vision_detail = {}
+        source_name = item.get("filename", "")
+        if input_folder:
+            cache_file = input_folder / f"{source_name}.pickinsta.json"
+            if cache_file.exists():
+                try:
+                    cache = json.loads(cache_file.read_text(encoding="utf-8"))
+                    vision = cache.get("vision", {})
+                    if any(c in vision for c in criteria):
+                        vision_detail = {c: vision.get(c, 0) for c in criteria}
+                except Exception:
+                    pass
+
+        # EXIF
+        exif_info = {}
+        if input_folder:
+            source_file = input_folder / source_name
+            if source_file.exists():
+                try:
+                    from PIL.ExifTags import TAGS as _EXIF_TAGS
+                    with Image.open(source_file) as _eimg:
+                        raw_exif = _eimg._getexif() or {}
+                    tagged = {_EXIF_TAGS.get(k, k): v for k, v in raw_exif.items()}
+                    if tagged.get("Make"):
+                        make = tagged["Make"].strip()
+                        model = tagged.get("Model", "").strip()
+                        if model.startswith(make):
+                            exif_info["camera"] = model
+                        else:
+                            exif_info["camera"] = f"{make} {model}".strip()
+                    if tagged.get("LensModel"):
+                        exif_info["lens"] = str(tagged["LensModel"]).strip()
+                    if tagged.get("FocalLength"):
+                        fl = tagged["FocalLength"]
+                        exif_info["focal"] = f"{float(fl):.0f}mm"
+                    if tagged.get("FNumber"):
+                        exif_info["aperture"] = f"f/{float(tagged['FNumber']):.1f}"
+                    if tagged.get("ExposureTime"):
+                        et = float(tagged["ExposureTime"])
+                        if et >= 1:
+                            exif_info["shutter"] = f"{et:.1f}s"
+                        else:
+                            exif_info["shutter"] = f"1/{int(round(1/et))}s"
+                    if tagged.get("ISOSpeedRatings"):
+                        exif_info["iso"] = f"ISO {tagged['ISOSpeedRatings']}"
+                    if tagged.get("DateTimeOriginal"):
+                        exif_info["date"] = str(tagged["DateTimeOriginal"])
+                except Exception:
+                    pass
+
+        data.append({
+            "rank": item["rank"],
+            "filename": source_name,
+            "final_score": item.get("final_score", 0),
+            "technical_composite": item.get("technical_composite", 0),
+            "vision_total": item.get("vision_total", 0),
+            "one_line": item.get("one_line", ""),
+            "output_cropped": _quote(item.get("output_cropped") or item.get("output", "")),
+            "output_hd": _quote(item.get("output_hd", "")),
+            "output_full": _quote(item.get("output_full", "")),
+            "uncertain_crop": item.get("uncertain_crop", False),
+            "vision_detail": vision_detail,
+            "yolo": yolo,
+            "exif": exif_info,
+            "burst": item.get("burst"),
+            "yolo_debug_img": _quote(yolo_debug_img) if yolo_debug_exists else None,
+        })
+    return data
+
+
+def generate_gallery(
+    output_folder: Path,
+    input_folder: Optional[Path] = None,
+    gallery_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Generate an index.html gallery in the output folder. Returns path or None."""
+    data = _gallery_build_data(output_folder, input_folder)
+    if not data:
+        return None
+
+    title = output_folder.name
+
+    if data:
+        avg_final = sum(d["final_score"] for d in data) / len(data)
+        avg_tech = sum(d["technical_composite"] for d in data) / len(data)
+        avg_vision = sum(d["vision_total"] for d in data) / len(data)
+        stats = [
+            ("Images", str(len(data))),
+            ("Top score", f"{data[0]['final_score']:.3f}"),
+            ("Avg final", f"{avg_final:.3f}"),
+            ("Avg technical", f"{avg_tech:.3f}"),
+            ("Avg vision", f"{avg_vision:.1f}/60"),
+            ("Uncertain crops", str(sum(1 for d in data if d["uncertain_crop"]))),
+        ]
+    else:
+        stats = [("Images", "0")]
+
+    summary_html = "\n".join(
+        f'<div class="stat"><div class="stat-label">{label}</div>'
+        f'<div class="stat-value">{value}</div></div>'
+        for label, value in stats
+    )
+    tiles_html = ""
+    for i, d in enumerate(data):
+        uncertain_badge = (
+            '<span class="tile-uncertain" title="Uncertain crop">'
+            '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'
+            '<path d="M6 2v14a2 2 0 002 2h14"/><path d="M18 22V8a2 2 0 00-2-2H2"/></svg></span>'
+            if d.get("uncertain_crop") else ""
+        )
+        burst = d.get("burst")
+        burst_badge = (
+            f'<span class="tile-burst" title="Best of {burst["count"]} (by {burst["selected_by"]})">'
+            f'&#x1F4F7;{burst["count"]}</span>'
+            if burst else ""
+        )
+        tiles_html += (
+            f'<div class="tile" data-idx="{i}" onclick="selectImage({i})">'
+            f'<img src="{d["output_cropped"]}" loading="lazy" alt="">'
+            f'<span class="tile-rank">#{d["rank"]}</span>'
+            f'{uncertain_badge}'
+            f'{burst_badge}'
+            f'<span class="tile-score">{d["final_score"]:.3f}</span>'
+            f'</div>\n'
+        )
+
+    # Breadcrumb
+    breadcrumb = ""
+    if gallery_root and output_folder != gallery_root:
+        try:
+            parts = output_folder.relative_to(gallery_root).parts
+            crumbs = ['<a href="' + "../" * len(parts) + '">Home</a>']
+            for i, part in enumerate(parts[:-1]):
+                depth = len(parts) - i - 1
+                href = "../" * depth
+                crumbs.append(f'<a href="{href}">{part}</a>')
+            sep = '<span class="sep">/</span>'
+            breadcrumb = f'<span class="breadcrumb">{sep.join(crumbs)}{sep}</span>'
+        except ValueError:
+            pass
+
+    html = _GALLERY_HTML_TEMPLATE.format(
+        title=title,
+        summary_stats=summary_html,
+        tiles=tiles_html,
+        json_data=json.dumps(data, indent=None),
+        breadcrumb=breadcrumb,
+    )
+    gallery_path = output_folder / "index.html"
+    gallery_path.write_text(html, encoding="utf-8")
+    return gallery_path
+
+
+_INDEX_HTML_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{
+    --bg: #0f0f0f; --surface: #1a1a1a; --surface2: #242424;
+    --border: #333; --text: #e0e0e0; --text-dim: #888;
+    --accent: #d32f2f;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+    padding: 2rem;
+  }}
+  h1 {{
+    font-size: 1.4rem; font-weight: 600; margin-bottom: 1.5rem;
+    display: flex; align-items: center; gap: .5rem;
+  }}
+  h1 span {{ color: var(--accent); }}
+  .gh-link {{
+    color: var(--text-dim); transition: color .15s;
+  }}
+  .gh-link:hover {{ color: var(--text); }}
+  .breadcrumb {{ display: inline; font-size: .85rem; color: var(--text-dim); }}
+  .breadcrumb a {{ color: var(--text-dim); text-decoration: none; }}
+  .breadcrumb a:hover {{ color: var(--text); text-decoration: underline; }}
+  .breadcrumb .sep {{ margin: 0 .3rem; }}
+  .folder-list {{
+    list-style: none;
+  }}
+  .folder-list li {{
+    margin-bottom: .5rem;
+  }}
+  .folder-link {{
+    display: flex; align-items: center; gap: .75rem;
+    padding: .75rem 1rem;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; text-decoration: none; color: var(--text);
+    transition: border-color .15s, background .15s;
+  }}
+  .folder-link:hover {{
+    border-color: var(--accent); background: var(--surface2);
+  }}
+  .folder-name {{
+    flex: 1; font-weight: 500;
+  }}
+  .folder-count {{
+    font-size: .85rem; color: var(--text-dim);
+    white-space: nowrap;
+  }}
+  .folder-thumb {{
+    width: 48px; height: 48px; border-radius: 4px;
+    object-fit: cover; background: var(--surface2); flex-shrink: 0;
+  }}
+  .breadcrumb {{
+    font-size: .85rem; color: var(--text-dim); margin-bottom: 1rem;
+  }}
+  .breadcrumb a {{ color: var(--accent); text-decoration: none; }}
+  .breadcrumb a:hover {{ text-decoration: underline; }}
+</style>
+</head>
+<body>
+<h1>
+  <a class="gh-link" href="https://github.com/renatobo/pickinsta" target="_blank" title="pickinsta on GitHub">
+    <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+  </a>
+  <span>pickinsta</span> {breadcrumb} {title}
+</h1>
+<ul class="folder-list">
+{rows}
+</ul>
+</body>
+</html>
+"""
+
+
+def generate_gallery_index(root: Path) -> list[Path]:
+    """Generate index.html files for all directories, recursively.
+
+    Leaf directories with selection_report.json get a gallery.
+    Parent directories get a folder listing linking to children.
+    Returns list of all generated index.html paths.
+    """
+    from urllib.parse import quote as _quote
+
+    # First, generate all leaf galleries
+    generated: list[Path] = []
+    reports = sorted(root.rglob("selection_report.json"))
+    gallery_dirs: set[Path] = set()
+    for rpt in reports:
+        result = generate_gallery(rpt.parent, gallery_root=root)
+        if result:
+            generated.append(result)
+            gallery_dirs.add(rpt.parent)
+
+    # Now generate index pages for every ancestor directory
+    # that contains galleries (directly or nested)
+    index_dirs: set[Path] = set()
+    for gdir in gallery_dirs:
+        parent = gdir.parent
+        while parent >= root:
+            index_dirs.add(parent)
+            if parent == root:
+                break
+            parent = parent.parent
+
+    for idx_dir in sorted(index_dirs):
+        # Collect immediate children that either have a gallery or have their own index
+        children = []
+        for child in sorted(idx_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            # Count galleries under this child
+            child_reports = list(child.rglob("selection_report.json"))
+            if not child_reports:
+                continue
+            total_images = 0
+            for cr in child_reports:
+                try:
+                    data = json.loads(cr.read_text(encoding="utf-8"))
+                    total_images += len(data)
+                except Exception:
+                    pass
+            # Find a thumbnail from the first gallery
+            thumb = ""
+            first_report = child_reports[0]
+            try:
+                data = json.loads(first_report.read_text(encoding="utf-8"))
+                if data:
+                    cropped = data[0].get("output_cropped") or data[0].get("output", "")
+                    if cropped:
+                        rel_path = first_report.parent.relative_to(idx_dir)
+                        thumb = str(rel_path / cropped)
+            except Exception:
+                pass
+
+            children.append({
+                "name": child.name,
+                "path": child.name + "/",
+                "galleries": len(child_reports),
+                "images": total_images,
+                "thumb": _quote(thumb) if thumb else "",
+            })
+
+        if not children:
+            continue
+
+        rows_html = ""
+        for c in children:
+            thumb_html = (
+                f'<img class="folder-thumb" src="{c["thumb"]}" loading="lazy" alt="">'
+                if c["thumb"] else ""
+            )
+            sub = f'{c["galleries"]} sessions, ' if c["galleries"] > 1 else ""
+            rows_html += (
+                f'<li><a class="folder-link" href="{_quote(c["path"])}">'
+                f'{thumb_html}'
+                f'<span class="folder-name">{c["name"]}</span>'
+                f'<span class="folder-count">{sub}{c["images"]} images</span>'
+                f'</a></li>\n'
+            )
+
+        # Breadcrumb
+        breadcrumb = ""
+        if idx_dir != root:
+            parts = idx_dir.relative_to(root).parts
+            crumbs = ['<a href="' + "../" * len(parts) + '">Home</a>']
+            for i, part in enumerate(parts[:-1]):
+                depth = len(parts) - i - 1
+                href = "../" * depth
+                crumbs.append(f'<a href="{href}">{part}</a>')
+            sep = '<span class="sep">/</span>'
+            breadcrumb = f'<span class="breadcrumb">{sep.join(crumbs)}{sep}</span>'
+
+        html = _INDEX_HTML_TEMPLATE.format(
+            title=idx_dir.name,
+            breadcrumb=breadcrumb,
+            rows=rows_html,
+        )
+        idx_path = idx_dir / "index.html"
+        idx_path.write_text(html, encoding="utf-8")
+        generated.append(idx_path)
+
+    return generated
 
 
 # ---------------------------------------------------------------------------

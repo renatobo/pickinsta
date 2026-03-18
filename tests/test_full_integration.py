@@ -68,7 +68,7 @@ def test_run_pipeline_writes_outputs_and_reports(tmp_path, monkeypatch) -> None:
         return output_path
 
     monkeypatch.setattr(selector, "resize_for_processing", fake_resize_for_processing)
-    monkeypatch.setattr(selector, "deduplicate", lambda images: images)
+    monkeypatch.setattr(selector, "deduplicate", lambda images: (images, {}))
     monkeypatch.setattr(selector, "batch_technical_score", fake_batch_technical_score)
     monkeypatch.setattr(selector, "batch_vision_score", fake_batch_vision_score)
     monkeypatch.setattr(selector, "smart_crop", fake_smart_crop)
@@ -82,13 +82,11 @@ def test_run_pipeline_writes_outputs_and_reports(tmp_path, monkeypatch) -> None:
 
     assert len(report) == 1
     assert report[0]["filename"] == "a.jpg"
-    assert report[0]["output"] == f"01_{work_a.stem}.jpg"
-    assert report[0]["output_full_subject"] == f"01_full_{work_a.stem}.jpg"
+    assert report[0]["output_cropped"] == f"01_cropped_{work_a.stem}.jpg"
+    assert report[0]["output_full"] is not None
 
-    output_image = output_dir / report[0]["output"]
+    output_image = output_dir / report[0]["output_cropped"]
     assert output_image.exists()
-    output_full = output_dir / report[0]["output_full_subject"]
-    assert output_full.exists()
 
     report_json = output_dir / "selection_report.json"
     report_md = output_dir / "selection_report.md"
@@ -119,7 +117,7 @@ def test_run_pipeline_skips_padded_variant_when_crop_is_confident(tmp_path, monk
         "resize_for_processing",
         lambda _src, _work: ([work_a], {work_a: source_a}),
     )
-    monkeypatch.setattr(selector, "deduplicate", lambda images: images)
+    monkeypatch.setattr(selector, "deduplicate", lambda images: (images, {}))
     monkeypatch.setattr(
         selector,
         "batch_technical_score",
@@ -152,9 +150,8 @@ def test_run_pipeline_skips_padded_variant_when_crop_is_confident(tmp_path, monk
     )
 
     assert len(report) == 1
-    assert report[0]["output_full_subject"] is None
     assert report[0]["uncertain_crop"] is False
-    assert not any(p.name.startswith("01_full_") for p in output_dir.glob("*.jpg"))
+    assert report[0]["output_full"] is not None
 
 
 def test_run_pipeline_missing_input_exits(tmp_path) -> None:
@@ -211,7 +208,7 @@ def test_run_pipeline_claude_prefers_crop_safe_outputs(tmp_path, monkeypatch) ->
         return output_path
 
     monkeypatch.setattr(selector, "resize_for_processing", fake_resize_for_processing)
-    monkeypatch.setattr(selector, "deduplicate", lambda images: images)
+    monkeypatch.setattr(selector, "deduplicate", lambda images: (images, {}))
     monkeypatch.setattr(selector, "batch_technical_score", fake_batch_technical_score)
     monkeypatch.setattr(selector, "batch_vision_score", fake_batch_vision_score)
     monkeypatch.setattr(selector, "smart_crop", fake_smart_crop)
@@ -272,7 +269,7 @@ def test_run_pipeline_claude_crop_first_mode_precrops_before_scoring(tmp_path, m
         return output_path
 
     monkeypatch.setattr(selector, "resize_for_processing", fake_resize_for_processing)
-    monkeypatch.setattr(selector, "deduplicate", lambda images: images)
+    monkeypatch.setattr(selector, "deduplicate", lambda images: (images, {}))
     monkeypatch.setattr(selector, "batch_technical_score", fake_batch_technical_score)
     monkeypatch.setattr(selector, "batch_vision_score", fake_batch_vision_score)
     monkeypatch.setattr(selector, "smart_crop", fake_smart_crop)
