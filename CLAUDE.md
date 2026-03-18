@@ -69,10 +69,9 @@ make pre-commit-install # Install pre-commit hooks (ruff + formatting on git com
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 make install-dev
-python -m pip install -e ".[clip,claude,yolo]"
 ```
 
-Optional scorers can be installed individually: `.[clip]`, `.[claude]`, `.[yolo]`.
+This installs dev tools and all scorer extras (clip, claude, yolo). To install only specific scorers: `pip install -e ".[dev,claude]"`, etc.
 
 ### Running the Pipeline
 

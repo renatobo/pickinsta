@@ -2016,10 +2016,13 @@ def _load_yolo_model(debug: bool = False):
     if _YOLO_MODEL is not None:
         return _YOLO_MODEL
 
+    import logging
+    os.environ.setdefault("YOLO_VERBOSE", "false")
+    logging.getLogger("ultralytics").setLevel(logging.WARNING)
     from ultralytics import YOLO
 
     model_path = resolve_yolo_model_path(debug=debug)
-    _YOLO_MODEL = YOLO(str(model_path))
+    _YOLO_MODEL = YOLO(str(model_path), task="detect", verbose=False)
     return _YOLO_MODEL
 
 
