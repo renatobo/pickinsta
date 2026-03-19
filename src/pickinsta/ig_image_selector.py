@@ -3488,6 +3488,349 @@ def _prepare_claude_crop_first_candidates(
 # ---------------------------------------------------------------------------
 
 
+def run_dedup_only(
+    input_folder: str,
+    output_folder: str = "selected",
+    work_folder: Optional[str] = None,
+):
+    """
+    Dedup-only mode: resize → deduplicate → output all unique images.
+    Best shot per burst selected by sharpness, then technical re-evaluation.
+    Outputs full/hd/cropped variants only — no scoring, no ranking, no debug.
+    """
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+
+    src = Path(input_folder)
+    out = Path(output_folder)
+    work = Path(work_folder) if work_folder else src.parent / f"{src.name}_work"
+
+    if not src.exists():
+        print(f"❌ Input folder not found: {src}")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("🏍️  Dedup-Only Mode")
+    print(f"   Input:  {src}")
+    print(f"   Output: {out}")
+    print("=" * 60)
+
+    # Stage 0: Resize
+    print(f"\n📐 Stage 0: Resizing to max {MAX_RESIZE_PX}px...")
+    resized, source_map = resize_for_processing(src, work)
+    if not resized:
+        print("❌ No valid images found.")
+        sys.exit(1)
+
+    # Stage 1: Deduplicate
+    print("\n🔍 Stage 1: Deduplicating (burst detection)...")
+    unique, burst_map = deduplicate(resized)
+
+    # Stage 2b: Burst re-evaluation with technical scoring
+    burst_items = [
+        (path, burst_map[path]) for path in unique if path in burst_map
+    ]
+    burst_swaps = 0
+    if burst_items:
+        from concurrent.futures import ThreadPoolExecutor as _TPEb
+        alt_paths = []
+        for rep, members in burst_items:
+            for p in members:
+                if p != rep:
+                    alt_paths.append(p)
+        alt_scores: dict[Path, dict] = {}
+        if alt_paths:
+            n_workers = min(len(alt_paths), os.cpu_count() or 4)
+            with _TPEb(max_workers=n_workers) as pool:
+                for result in zip(alt_paths, pool.map(_score_technical_with_cache, alt_paths)):
+                    path, res = result
+                    if res is not None:
+                        alt_scores[res[0]] = res[1]
+        # Also score the representatives
+        rep_paths = [rep for rep, _ in burst_items]
+        if rep_paths:
+            n_workers = min(len(rep_paths), os.cpu_count() or 4)
+            with _TPEb(max_workers=n_workers) as pool:
+                for result in zip(rep_paths, pool.map(_score_technical_with_cache, rep_paths)):
+                    path, res = result
+                    if res is not None:
+                        alt_scores[res[0]] = res[1]
+
+        new_unique = []
+        for path in unique:
+            if path not in burst_map:
+                new_unique.append(path)
+                continue
+            members = burst_map[path]
+            best_path = path
+            best_composite = alt_scores.get(path, {}).get("composite", 0)
+            for m in members:
+                mc = alt_scores.get(m, {}).get("composite", 0)
+                if mc > best_composite:
+                    best_composite = mc
+                    best_path = m
+            if best_path != path:
+                burst_swaps += 1
+            new_unique.append(best_path)
+        unique = new_unique
+
+    if burst_swaps:
+        print(f"  🔄 Burst re-evaluation: swapped {burst_swaps} images for better technical scores")
+
+    # Build burst lookup for gallery (keyed on selected path)
+    burst_info_map: dict[Path, list[Path]] = {}
+    for orig_rep, members in burst_map.items():
+        # Find which unique path corresponds to this burst
+        for u in unique:
+            if u == orig_rep or u in members:
+                burst_info_map[u] = members
+                break
+
+    # Output
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"\n✂️  Outputting {len(unique)} images (full/hd/cropped)...")
+
+    # Naming: <stem>_full.<ext>, <stem>_hd.jpg, <stem>_cropped.jpg
+    output_plan = []
+    for i, work_path in enumerate(unique):
+        output_stem = (source_map.get(work_path) or work_path).stem
+        source_ext = (source_map.get(work_path) or work_path).suffix
+        output_plan.append({
+            "work_path": work_path,
+            "source_path": source_map.get(work_path),
+            "dest_cropped": out / f"{output_stem}_cropped.jpg",
+            "dest_hd": out / f"{output_stem}_hd.jpg",
+            "dest_full": out / f"{output_stem}_full{source_ext}",
+            "display_name": (source_map.get(work_path) or work_path).name,
+        })
+
+    crop_args = [
+        (i, plan["work_path"], plan["dest_cropped"])
+        for i, plan in enumerate(output_plan)
+    ]
+    crop_results: dict[int, dict] = {}
+    n_workers = min(len(crop_args), os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for idx, meta in pool.map(_crop_one_image_no_debug, crop_args):
+            crop_results[idx] = meta
+
+    gallery_items = []
+    written = 0
+    for i, plan in enumerate(output_plan):
+        crop_meta = crop_results.get(i, {})
+        if crop_meta.get("_failed"):
+            print(f"  ⚠ Could not crop {plan['work_path'].name}")
+            continue
+
+        # HD
+        try:
+            shutil.copy2(str(plan["work_path"]), str(plan["dest_hd"]))
+        except Exception:
+            pass
+
+        # Full
+        source = plan["source_path"] or plan["work_path"]
+        try:
+            shutil.copy2(str(source), str(plan["dest_full"]))
+        except Exception:
+            pass
+
+        burst_members = burst_info_map.get(unique[i])
+
+        # EXIF
+        exif_info = {}
+        source_file = plan["source_path"] or plan["work_path"]
+        try:
+            from PIL.ExifTags import TAGS as _EXIF_TAGS
+            with Image.open(source_file) as _eimg:
+                raw_exif = _eimg._getexif() or {}
+            tagged = {_EXIF_TAGS.get(k, k): v for k, v in raw_exif.items()}
+            if tagged.get("Make"):
+                make = tagged["Make"].strip()
+                model = tagged.get("Model", "").strip()
+                exif_info["camera"] = model if model.startswith(make) else f"{make} {model}".strip()
+            if tagged.get("LensModel"):
+                exif_info["lens"] = str(tagged["LensModel"]).strip()
+            if tagged.get("FocalLength"):
+                exif_info["focal"] = f"{float(tagged['FocalLength']):.0f}mm"
+            if tagged.get("FNumber"):
+                exif_info["aperture"] = f"f/{float(tagged['FNumber']):.1f}"
+            if tagged.get("ExposureTime"):
+                et = float(tagged["ExposureTime"])
+                exif_info["shutter"] = f"{et:.1f}s" if et >= 1 else f"1/{int(round(1/et))}s"
+            if tagged.get("ISOSpeedRatings"):
+                exif_info["iso"] = f"ISO {tagged['ISOSpeedRatings']}"
+            if tagged.get("DateTimeOriginal"):
+                exif_info["date"] = str(tagged["DateTimeOriginal"])
+        except Exception:
+            pass
+
+        gallery_items.append({
+            "filename": plan["display_name"],
+            "cropped": plan["dest_cropped"].name,
+            "hd": plan["dest_hd"].name,
+            "full": plan["dest_full"].name,
+            "burst_count": len(burst_members) if burst_members else 0,
+            "exif": exif_info,
+        })
+        written += 1
+
+    # Simplified gallery
+    _generate_dedup_gallery(out, gallery_items)
+
+    print(f"\n{'=' * 60}")
+    print(f"🏆 Done! {written} unique images saved to {out}/")
+    print(f"🗂️  Work folder retained: {work}")
+    print(f"🌐 Gallery: {out / 'index.html'}")
+    print(f"{'=' * 60}")
+
+
+_DEDUP_GALLERY_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  :root {{ --bg: #0f0f0f; --surface: #1a1a1a; --surface2: #242424; --border: #333;
+    --text: #e0e0e0; --text-dim: #888; --accent: #d32f2f; --accent-dim: #b71c1c; --gold: #ffd54f; }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5; }}
+  header {{ padding: 1rem 2rem; border-bottom: 1px solid var(--border); background: var(--surface); }}
+  header h1 {{ font-size: 1.3rem; font-weight: 600; display: flex; align-items: center; gap: .5rem; }}
+  header h1 span {{ color: var(--accent); }}
+  .info {{ padding: .5rem 2rem; font-size: .8rem; color: var(--text-dim); border-bottom: 1px solid var(--border); background: var(--surface); }}
+  .layout {{ display: flex; height: calc(100vh - 80px); }}
+  .grid-panel {{ flex: 1; overflow-y: auto; padding: .75rem; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .5rem; }}
+  .tile {{ position: relative; cursor: pointer; border-radius: 6px; overflow: hidden;
+    border: 2px solid transparent; transition: border-color .15s, transform .15s; }}
+  .tile:hover {{ border-color: var(--accent); transform: scale(1.02); }}
+  .tile.active {{ border-color: var(--gold); }}
+  .tile img {{ width: 100%; aspect-ratio: 3/4; object-fit: cover; display: block; }}
+  .tile-burst {{ position: absolute; bottom: 4px; left: 4px; background: rgba(0,0,0,.75);
+    color: #81d4fa; font-size: .6rem; padding: 1px 5px; border-radius: 4px; }}
+  .detail-panel {{ width: 400px; min-width: 400px; overflow-y: auto; background: var(--surface);
+    border-left: 1px solid var(--border); padding: 1rem; display: none; }}
+  .detail-panel.open {{ display: flex; flex-direction: column; }}
+  .detail-panel h2 {{ font-size: .9rem; font-weight: 600; margin-bottom: .5rem; word-break: break-all; }}
+  .version-tabs {{ display: flex; gap: 3px; margin-bottom: .5rem; }}
+  .version-tabs button {{ flex: 1; padding: .3rem; font-size: .7rem; background: var(--surface2);
+    color: var(--text-dim); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }}
+  .version-tabs button.active {{ background: var(--accent-dim); color: #fff; border-color: var(--accent); }}
+  .preview-img {{ width: 100%; border-radius: 4px; background: var(--surface2); }}
+  .exif-row {{ display: flex; flex-wrap: wrap; gap: .3rem .75rem; font-size: .75rem;
+    color: var(--text-dim); margin-top: .5rem; }}
+  .exif-row span {{ white-space: nowrap; }}
+  .exif-val {{ color: var(--text); font-weight: 500; }}
+</style>
+</head>
+<body>
+<header><h1><span>pickinsta</span> {title} &mdash; dedup</h1></header>
+<div class="info">{count} unique images</div>
+<div class="layout">
+  <div class="grid-panel"><div class="grid" id="grid">{tiles}</div></div>
+  <div class="detail-panel" id="detail">
+    <h2 id="detail-title"></h2>
+    <div class="version-tabs" id="version-tabs"></div>
+    <a id="preview-link" href="" target="_blank"><img class="preview-img" id="preview-img" src="" alt=""></a>
+    <div class="exif-row" id="detail-exif"></div>
+  </div>
+</div>
+<script>
+const DATA = {json_data};
+function sel(i) {{
+  document.querySelectorAll('.tile').forEach(t => t.classList.remove('active'));
+  const tile = document.querySelector(`.tile[data-idx="${{i}}"]`);
+  if (tile) tile.classList.add('active');
+  document.getElementById('detail').classList.add('open');
+  const d = DATA[i];
+  document.getElementById('detail-title').textContent = d.filename;
+  const tabs = document.getElementById('version-tabs');
+  const img = document.getElementById('preview-img');
+  const link = document.getElementById('preview-link');
+  const versions = [['Full', d.full], ['HD', d.hd], ['Cropped', d.cropped]].filter(v => v[1]);
+  tabs.innerHTML = '';
+  versions.forEach(([label, file], j) => {{
+    const btn = document.createElement('button');
+    btn.textContent = label;
+    btn.onclick = () => {{ img.src = file; link.href = file;
+      tabs.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active'); }};
+    if (j === 0) btn.classList.add('active');
+    tabs.appendChild(btn);
+  }});
+  if (versions.length) {{ img.src = versions[0][1]; link.href = versions[0][1]; }}
+  const exifDiv = document.getElementById('detail-exif');
+  if (d.exif && Object.keys(d.exif).length) {{
+    let eh = '';
+    ['camera','lens','focal','aperture','shutter','iso','date'].forEach(k => {{
+      if (d.exif[k]) eh += `<span><span class="exif-val">${{d.exif[k]}}</span></span>`;
+    }});
+    exifDiv.innerHTML = eh;
+  }} else {{ exifDiv.innerHTML = ''; }}
+}}
+if (DATA.length) sel(0);
+</script>
+</body>
+</html>
+"""
+
+
+def _generate_dedup_gallery(output_folder: Path, items: list[dict]) -> None:
+    """Generate a simplified gallery for dedup-only mode."""
+    from urllib.parse import quote as _q
+
+    title = output_folder.name
+    tiles = ""
+    for i, item in enumerate(items):
+        burst_badge = (
+            f'<span class="tile-burst">&#x1F4F7;{item["burst_count"]}</span>'
+            if item.get("burst_count", 0) > 1 else ""
+        )
+        tiles += (
+            f'<div class="tile" data-idx="{i}" onclick="sel({i})">'
+            f'<img src="{_q(item["cropped"])}" loading="lazy" alt="">'
+            f'{burst_badge}'
+            f'</div>\n'
+        )
+
+    json_items = [
+        {"filename": it["filename"], "cropped": _q(it["cropped"]),
+         "hd": _q(it["hd"]), "full": _q(it["full"]),
+         "exif": it.get("exif", {})}
+        for it in items
+    ]
+
+    html = _DEDUP_GALLERY_TEMPLATE.format(
+        title=title,
+        count=len(items),
+        tiles=tiles,
+        json_data=json.dumps(json_items, indent=None),
+    )
+    (output_folder / "index.html").write_text(html, encoding="utf-8")
+
+
+def _crop_one_image_no_debug(args: tuple) -> tuple[int, dict]:
+    """Smart-crop one image without debug output. For dedup-only mode."""
+    idx, src_path, dest_path = args
+    meta: dict[str, object] = {}
+    try:
+        smart_crop(src_path, dest_path, save_debug=False, meta_out=meta)
+    except Exception:
+        try:
+            with Image.open(src_path) as img:
+                img = img.convert("RGB")
+                img = img.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT), Image.LANCZOS)
+                img.save(dest_path, "JPEG", quality=95)
+            meta = {"uncertain_crop": True}
+        except Exception:
+            meta = {"_failed": True}
+    return (idx, meta)
+
+
 def _crop_one_image(args: tuple) -> tuple[int, dict]:
     """Smart-crop one image for Stage 4. Module-level for ProcessPoolExecutor pickling."""
     idx, src_path, dest_path = args
@@ -4652,8 +4995,25 @@ Examples:
         action="store_true",
         help="Force re-scoring all images, ignoring cached vision scores.",
     )
+    parser.add_argument(
+        "--dedup-only",
+        dest="dedup_only",
+        action="store_true",
+        help=(
+            "Dedup-only mode: select best shot per burst, output all unique images "
+            "as full/hd/cropped. No scoring, no ranking, no debug files."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.dedup_only:
+        run_dedup_only(
+            input_folder=args.input,
+            output_folder=args.output,
+            work_folder=args.work,
+        )
+        sys.exit(0)
 
     run_pipeline(
         input_folder=args.input,

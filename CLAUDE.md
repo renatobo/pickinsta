@@ -126,6 +126,12 @@ pickinsta ./input --scorer claude --claude-model claude-sonnet-4-6 --rescore
 
 # Ollama scorer (self-hosted), score all candidates
 pickinsta ./input --output ./selected --scorer ollama --all
+
+# Dedup-only: best shot per burst, all unique images, no scoring/ranking
+pickinsta ./input --output ./deduped --dedup-only
+
+# Dedup-only with separate work folder
+pickinsta ./input --output ./deduped --work ./work --dedup-only
 ```
 
 ### Environment Setup
@@ -161,6 +167,7 @@ Key variables:
 - `--claude-model` — override Claude model
 - `--claude-crop-first` — pre-crop to 1080x1440 before Claude scoring
 - `--rescore` — force re-scoring, ignoring all cached vision scores
+- `--dedup-only` — dedup-only mode: best shot per burst, output all unique images as full/hd/cropped (no scoring, no ranking, no debug)
 
 ### Testing
 
