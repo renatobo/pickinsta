@@ -1,29 +1,30 @@
-# Ollama Server Setup (macOS + Linux)
+# Ollama Server Setup
 
-This is a quick setup reference for running your own Ollama server for `pickinsta`.
-Use this page for the minimum commands, and rely on the official docs for full details and platform-specific troubleshooting.
+This guide covers the practical setup needed to use `pickinsta --scorer ollama` against a local or remote Ollama host.
 
-## Official Documentation (primary source)
+Use the official Ollama docs for platform-specific installation details and this page for the `pickinsta` integration layer.
 
-- Docs home: [https://docs.ollama.com/](https://docs.ollama.com/)
-- Quickstart: [https://docs.ollama.com/quickstart](https://docs.ollama.com/quickstart)
-- macOS install: [https://docs.ollama.com/macos](https://docs.ollama.com/macos)
-- Linux install: [https://docs.ollama.com/linux](https://docs.ollama.com/linux)
-- FAQ (server env/config): [https://docs.ollama.com/faq](https://docs.ollama.com/faq)
-- Modelfile reference: [https://docs.ollama.com/modelfile](https://docs.ollama.com/modelfile)
-- Importing models (Safetensors/GGUF): [https://docs.ollama.com/import](https://docs.ollama.com/import)
-- Qwen3-VL 8B model page: [https://ollama.com/library/qwen3-vl:8b](https://ollama.com/library/qwen3-vl:8b)
-- InternVL3.5 model page: [https://ollama.com/blaifa/InternVL3_5](https://ollama.com/blaifa/InternVL3_5)
-- MiniCPM-v4.5 model page: [https://ollama.com/openbmb/minicpm-v4.5](https://ollama.com/openbmb/minicpm-v4.5)
+## Official References
+
+- Docs home: <https://docs.ollama.com/>
+- Quickstart: <https://docs.ollama.com/quickstart>
+- macOS install: <https://docs.ollama.com/macos>
+- Linux install: <https://docs.ollama.com/linux>
+- FAQ: <https://docs.ollama.com/faq>
+- Modelfile reference: <https://docs.ollama.com/modelfile>
+- Importing models: <https://docs.ollama.com/import>
+
+Example vision model pages used by this repo:
+
+- <https://ollama.com/library/qwen3-vl:8b>
+- <https://ollama.com/blaifa/InternVL3_5>
+- <https://ollama.com/openbmb/minicpm-v4.5>
 
 ## 1. Install Ollama
 
 ### macOS
 
-Follow the official macOS instructions:
-- [https://docs.ollama.com/macos](https://docs.ollama.com/macos)
-
-Brief CLI check:
+Follow the official macOS instructions, then verify:
 
 ```bash
 ollama -v
@@ -31,33 +32,29 @@ ollama -v
 
 ### Linux
 
-Follow the official Linux instructions:
-- [https://docs.ollama.com/linux](https://docs.ollama.com/linux)
-
-Brief CLI install/check:
+Follow the official Linux instructions, then verify:
 
 ```bash
-curl -fsSL https://ollama.com/install.sh | sh
 ollama -v
 ```
 
-## 2. Start the server
+## 2. Start and Verify the Server
 
 ### macOS
 
-If using the app-based install, start the Ollama app and verify with:
+If using the app-based install, start the Ollama app and verify:
 
 ```bash
 curl http://127.0.0.1:11434/api/tags
 ```
 
-To expose on your LAN, set host via `launchctl` (see FAQ for full steps):
+To expose the server on your LAN:
 
 ```bash
 launchctl setenv OLLAMA_HOST "0.0.0.0:11434"
 ```
 
-Reference: [https://docs.ollama.com/faq](https://docs.ollama.com/faq)
+See the Ollama FAQ for the full persistence story on macOS.
 
 ### Linux
 
@@ -69,98 +66,17 @@ sudo systemctl status ollama
 curl http://127.0.0.1:11434/api/tags
 ```
 
-To expose on your LAN, set `OLLAMA_HOST` via systemd override (full steps in docs):
+To expose the server on your LAN, create a systemd override:
 
 ```bash
 sudo systemctl edit ollama.service
-# add:
-# [Service]
-# Environment="OLLAMA_HOST=0.0.0.0:11434"
-sudo systemctl daemon-reload
-sudo systemctl restart ollama
 ```
 
-Reference: [https://docs.ollama.com/faq](https://docs.ollama.com/faq)
-
-## 3. Pull the models for speed comparison
-
-For the 4-model comparison benchmark, prepare these tags on the server:
-
-```bash
-ollama pull qwen3-vl:8b
-ollama pull blaifa/InternVL3_5:8b
-ollama pull blaifa/InternVL3_5:4B
-ollama pull openbmb/minicpm-v4.5:8b
-```
-
-Then verify:
-
-```bash
-ollama list
-```
-
-### 3.1 InternVL3.5 pull check
-
-If the namespaced tag is available on your server:
-
-```bash
-ollama pull blaifa/InternVL3_5
-ollama list
-```
-
-If your local tag name differs, use your local tag in the benchmark `--models` list.
-
-## 3.2 Version check
-
-Check your server version:
-
-```bash
-ollama -v
-```
-
-If your version is `0.16.3`, you are already above `0.7.0`, so version is not the blocker.
-
-## 4. Point pickinsta to your remote server
-
-In your `.env`:
-
-```bash
-PICKINSTA_OLLAMA_BASE_URL=http://YOUR_SERVER_IP:11434
-PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b
-```
-
-Run:
-
-```bash
-pickinsta ./input --output ./selected --scorer ollama --all
-```
-
-## 5. Simple remote test from your local machine
-
-Assuming Ollama is reachable on your network:
-
-```bash
-curl http://<SERVER_IP>:11434/api/generate \
-  -d '{"model": "qwen2.5vl:7b", "prompt": "Hello", "stream": false}'
-```
-
-Optional environment variable form:
-
-```bash
-export PICKINSTA_OLLAMA_HOST_URL="http://<SERVER_IP>:11434"
-curl "${PICKINSTA_OLLAMA_HOST_URL}/api/generate" \
-  -d '{"model": "qwen2.5vl:7b", "prompt": "Hello", "stream": false}'
-```
-
-## 6. Throughput tuning (CPU and mixed workloads)
-
-Start with conservative parallelism and tune using benchmark throughput (`sec/img`):
+Add:
 
 ```ini
 [Service]
-Environment="OLLAMA_NUM_PARALLEL=4"
-Environment="OLLAMA_NUM_THREAD=3"
-Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_HOST=0.0.0.0:11434"
 ```
 
 Then:
@@ -170,18 +86,113 @@ sudo systemctl daemon-reload
 sudo systemctl restart ollama
 ```
 
-On the `pickinsta` side, increase request concurrency carefully:
+## 3. Pull a Model
+
+The default `pickinsta` Ollama model is:
+
+```text
+qwen2.5vl:7b
+```
+
+Pull it with:
+
+```bash
+ollama pull qwen2.5vl:7b
+```
+
+Verify:
+
+```bash
+ollama list
+```
+
+For comparison testing, common model tags in this repo are:
+
+```bash
+ollama pull qwen3-vl:8b
+ollama pull blaifa/InternVL3_5:8b
+ollama pull blaifa/InternVL3_5:4B
+ollama pull openbmb/minicpm-v4.5:8b
+```
+
+If namespaced tags resolve differently on your host, use the exact local names shown by `ollama list`.
+
+## 4. Point pickinsta at the Server
+
+Set environment variables in `.env` or your shell:
+
+```bash
+PICKINSTA_OLLAMA_BASE_URL=http://YOUR_SERVER_IP:11434
+PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b
+```
+
+Optional client-side tuning:
+
+```bash
+PICKINSTA_OLLAMA_TIMEOUT_SEC=300
+PICKINSTA_OLLAMA_MAX_IMAGE_EDGE=1024
+PICKINSTA_OLLAMA_JPEG_QUALITY=80
+PICKINSTA_OLLAMA_KEEP_ALIVE=10m
+PICKINSTA_OLLAMA_USE_YOLO_CONTEXT=false
+PICKINSTA_OLLAMA_CONCURRENCY=2
+PICKINSTA_OLLAMA_MAX_RETRIES=2
+PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC=0.75
+PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6
+```
+
+Then run:
+
+```bash
+pickinsta ./input --output ./selected --scorer ollama --all
+```
+
+## 5. Smoke Test the Remote Host
+
+Quick API connectivity test:
+
+```bash
+curl http://<SERVER_IP>:11434/api/generate \
+  -d '{"model":"qwen2.5vl:7b","prompt":"Hello","stream":false}'
+```
+
+If this fails, fix server reachability before debugging `pickinsta`.
+
+## 6. Tune Throughput
+
+Start conservatively. Measure actual throughput in seconds per image rather than optimizing for raw CPU utilization.
+
+Linux `systemd` example:
+
+```ini
+[Service]
+Environment="OLLAMA_NUM_PARALLEL=4"
+Environment="OLLAMA_NUM_THREAD=3"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+```
+
+Apply:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+```
+
+Then tune the client side:
 
 ```bash
 export PICKINSTA_OLLAMA_CONCURRENCY=4
 ```
 
-Note: CPU utilization near 50% on hyper-threaded CPUs can still be near peak
-inference throughput; optimize for benchmark speed rather than raw CPU%.
+Practical notes:
 
-## 7. Run the 4-model manual speed benchmark
+- Increase server and client concurrency together.
+- If latency spikes or failures rise, back concurrency down.
+- `PICKINSTA_OLLAMA_USE_YOLO_CONTEXT=true` can improve quality but usually adds cost and latency.
+- `PICKINSTA_OLLAMA_KEEP_ALIVE=10m` helps when the same model is used repeatedly in one batch.
 
-From the project root:
+## 7. Benchmark Model Speed
+
+Run the multi-model benchmark from the project root:
 
 ```bash
 .venv/bin/python tests/benchmarks/benchmark_ollama_models.py \
@@ -192,17 +203,30 @@ From the project root:
   --report docs/ollama-model-speed-benchmark-report.md
 ```
 
-If your tag names differ, replace them in `--models` with your exact local tags from `ollama list`.
+This produces a Markdown report comparing:
 
-The report compares:
 - average seconds per image
 - average images per minute
-- average run duration
+- average total duration
 - failures per run
 
-## 8. Save per-model outputs in separate folders (scored images + reports)
+If your local tags differ, replace the `--models` values with the exact names from `ollama list`.
 
-Use this when you want full result artifacts per model and per run, not only speed tables.
+## 8. Benchmark With and Without YOLO Context
+
+```bash
+.venv/bin/python tests/benchmarks/benchmark_ollama_yolo.py \
+  --input ./input \
+  --runs 2 \
+  --all \
+  --report docs/ollama-yolo-benchmark-report.md
+```
+
+Use this when you want to measure the quality or latency impact of attaching YOLO subject context to the prompt.
+
+## 9. Save Full Per-Model Output Artifacts
+
+If you want each model run to produce its own selected outputs and reports, loop over models and write to separate output folders. Example:
 
 ```bash
 #!/usr/bin/env bash
@@ -256,8 +280,17 @@ PY
 done
 ```
 
-Output structure:
-- `model_compare_<timestamp>/run_1/<model_slug>/...`
-- `model_compare_<timestamp>/run_2/<model_slug>/...`
-- each model folder contains ranked images + `selection_report.json` + `selection_report.md`
-- `timing_summary.csv` gives runtime per model/run for direct speed comparison
+## 10. Common Failure Cases
+
+- `curl /api/tags` fails:
+  The server is not reachable yet. Fix host, port, firewall, or service state first.
+
+- `pickinsta` says the model is missing:
+  Pull the exact model on the Ollama host and confirm it appears in `ollama list`.
+
+- Requests time out:
+  Raise `PICKINSTA_OLLAMA_TIMEOUT_SEC` and reduce `PICKINSTA_OLLAMA_CONCURRENCY`.
+
+- Server is reachable but throughput is poor:
+  Tune `OLLAMA_NUM_PARALLEL`, `OLLAMA_NUM_THREAD`, and `PICKINSTA_OLLAMA_CONCURRENCY` together, then rerun the benchmark scripts.
+

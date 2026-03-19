@@ -4,118 +4,106 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
 
-Instagram image selection pipeline package.
+`pickinsta` turns a folder of event photos into ranked, Instagram-ready portrait selections. It deduplicates burst shots, scores technical quality, adds a vision pass with CLIP, Claude, or Ollama, then generates smart crops, reports, and an HTML gallery.
 
-## Quick start
+## What It Does
+
+- Resizes source images into a work area so later stages are faster and consistent.
+- Collapses near-duplicate burst sequences to the best representative image.
+- Scores technical quality with OpenCV-based metrics such as sharpness, lighting, composition, and clutter.
+- Applies a vision scorer:
+  - `clip`: local, free, zero API cost
+  - `claude`: API-based, strongest quality/ranking
+  - `ollama`: self-hosted vision scoring
+- Creates three ranked output variants per selected image:
+  - `NN_cropped_<name>.jpg`
+  - `NN_hd_<name>.jpg`
+  - `NN_full_<name>.<ext>`
+- Writes `selection_report.json`, `selection_report.md`, and `index.html`.
+
+## Quick Start
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 make install-dev
-python -m pip install -e ".[clip,claude,yolo]"
+
+mkdir -p ./input ./selected
 pickinsta ./input --output ./selected --top 10 --scorer clip
 ```
 
-## Documentation
+For the default full local setup, `make install-dev` installs dev tooling and all scorer extras.
 
-Project docs are in `/Users/renatobo/development/pickinsta/docs`:
-- `docs/README.md` (documentation index)
-- `docs/composition-rules.md` (composition/scoring/cropping reference)
-- `docs/troubleshooting.md` (setup and runtime troubleshooting)
-- `docs/ollama-server-setup.md` (self-hosted Ollama setup for macOS/Linux)
+## Installation
 
-## Pipeline workflow
-
-![pickinsta high-level pipeline](docs/assets/pipeline-high-level.svg)
-
-Detailed flow:
-
-```mermaid
-flowchart TD
-    A["Input folder (raw event photos)"] --> B["Stage 0: Resize<br/>Longest edge <= 1920px, EXIF-safe"]
-    B --> C["Stage 1: Deduplicate<br/>Perceptual hash grouping"]
-    C --> D["Stage 2: Technical scoring<br/>Sharpness, lighting, composition, color, clutter"]
-    D --> E["Select vision candidates<br/>Top N or --vision-pct or --all"]
-    E --> F{"Stage 3 scorer"}
-
-    F -->|clip| G["CLIP scoring (local)"]
-    F -->|claude| H["Resolve ANTHROPIC_API_KEY + model"]
-    H --> I["Check per-image cache<br/>*.pickinsta.json"]
-    I --> J{"Cache hit?"}
-    J -->|yes| K["Use cached Claude score"]
-    J -->|no| L["Claude vision scoring<br/>Optional YOLO context for subject info"]
-    L --> M["Save cache entry"]
-    F -->|ollama| Q["Resolve Ollama base URL + model<br/>Optional YOLO context"]
-
-    G --> N["Final score<br/>0.3 * technical + 0.7 * vision"]
-    K --> N
-    M --> N
-    Q --> N
-
-    N --> O["Stage 4: Smart crop<br/>YOLO-guided crop to 1080x1440<br/>Fallback: saliency/center"]
-    O --> P["Output top N images + reports<br/>selection_report.json and selection_report.md<br/>Optional *_full_* fallback only for uncertain crops"]
-```
-
-## Install (recommended)
+### Recommended
 
 ```bash
-cd /path/to/pickinsta
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools
-python -m pip install -e ".[clip,claude,yolo]"
-python -c "import transformers, torch, anthropic, ultralytics; print(transformers.__version__, torch.__version__, anthropic.__version__, ultralytics.__version__)"
+make install-dev
 ```
 
-If you only need one scorer:
+### Minimal package install
 
 ```bash
-# CLIP only
+python -m pip install -e .
+```
+
+This gives the core package plus technical scoring and image processing dependencies.
+
+### Install only the scorer extras you need
+
+```bash
+# CLIP scorer
 python -m pip install -e ".[clip]"
 
-# Claude only
+# Claude scorer
 python -m pip install -e ".[claude]"
 
-# YOLO support (smart crop + Claude context enrichment)
+# YOLO support for smart crop and richer scorer context
 python -m pip install -e ".[yolo]"
+
+# Full runtime without dev tools
+python -m pip install -e ".[clip,claude,yolo]"
 ```
 
-If `ultralytics` is not installed, YOLO is disabled and smart crop falls back to saliency/center heuristics.
+Optional dependency groups from [`pyproject.toml`](/home/renatobo/devel/pickinsta/pyproject.toml):
 
-## Optional manual dependency install
+- `dev`: `pytest`, `ruff`, `pre-commit`
+- `clip`: `transformers`, `torch`
+- `claude`: `anthropic`, `tqdm`
+- `yolo`: `ultralytics`
 
-```bash
-pip install Pillow opencv-python-headless numpy imagehash
-pip install transformers torch
-pip install anthropic tqdm
-pip install ultralytics
-```
+If `ultralytics` is missing, smart crop falls back to non-YOLO heuristics.
 
-## .env setup (Claude/Ollama + optional HF token)
+## Configuration
 
-Create a `.env` file with your key:
+Copy the example env file:
 
 ```bash
 cp .env.example .env
-# then edit .env and set your real key
 ```
 
-Required content:
+Common variables:
 
 ```bash
+# Required for --scorer claude
 ANTHROPIC_API_KEY=your_key_here
-```
 
-Optional content:
-
-```bash
-HF_TOKEN=hf_xxx_your_token
-# optional Claude model override:
+# Optional Claude model override
 ANTHROPIC_MODEL=claude-sonnet-4-6
-# optional Ollama remote server + model:
-PICKINSTA_OLLAMA_BASE_URL=http://remote-machine-or-ip:11434
+
+# Optional CLIP / Hugging Face token
+HF_TOKEN=hf_xxx_your_token
+
+# Optional prompt/account context
+PICKINSTA_ACCOUNT_CONTEXT="motorcycle enthusiast account"
+
+# Optional Ollama endpoint and model
+PICKINSTA_OLLAMA_BASE_URL=http://127.0.0.1:11434
 PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b
-# optional Ollama speed/stability tuning:
 PICKINSTA_OLLAMA_TIMEOUT_SEC=300
 PICKINSTA_OLLAMA_MAX_IMAGE_EDGE=1024
 PICKINSTA_OLLAMA_JPEG_QUALITY=80
@@ -125,88 +113,134 @@ PICKINSTA_OLLAMA_CONCURRENCY=2
 PICKINSTA_OLLAMA_MAX_RETRIES=2
 PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC=0.75
 PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6
-# optional account context used in Claude prompt:
-PICKINSTA_ACCOUNT_CONTEXT="motorcycle enthusiast account"
+
+# Optional custom YOLO weights
+PICKINSTA_YOLO_MODEL=/absolute/path/to/model.pt
 ```
 
-When `--scorer claude` is used, `pickinsta` checks:
-1. `ANTHROPIC_API_KEY` from the current environment
-2. `.env` in the current working directory
-3. `.env` in the input photos folder
+Environment resolution behavior:
 
-When `--scorer clip` is used, `HF_TOKEN` is optional. If present, `pickinsta`
-loads it from environment or `.env` (same search order) to reduce HF warnings
-and improve download/rate limits. If missing, CLIP still runs.
+- Claude API key and model settings are resolved from environment, then `cwd/.env`, then `<input>/.env`.
+- `HF_TOKEN` follows the same search order.
+- Ollama settings follow the same search order and default to `http://127.0.0.1:11434` with model `qwen2.5vl:7b`.
+- `CLAUDE_MODEL` is accepted as a fallback alias for `ANTHROPIC_MODEL`.
 
-When `--scorer ollama` is used, `PICKINSTA_OLLAMA_BASE_URL` and `PICKINSTA_OLLAMA_MODEL` are
-loaded from environment or `.env` (same search order). Defaults:
-- `PICKINSTA_OLLAMA_BASE_URL=http://127.0.0.1:11434`
-- `PICKINSTA_OLLAMA_MODEL=qwen2.5vl:7b`
+## Usage
 
-Performance defaults for Ollama are tuned for remote servers:
-- `PICKINSTA_OLLAMA_TIMEOUT_SEC=300` (avoid premature client disconnects)
-- `PICKINSTA_OLLAMA_MAX_IMAGE_EDGE=1024` and `PICKINSTA_OLLAMA_JPEG_QUALITY=80`
-- `PICKINSTA_OLLAMA_KEEP_ALIVE=10m` (keeps model loaded between requests)
-- `PICKINSTA_OLLAMA_USE_YOLO_CONTEXT=false` (set `true` for higher quality, slower)
-- `PICKINSTA_OLLAMA_CONCURRENCY=2` (parallel requests; start at 2-4 and tune per host)
-- `PICKINSTA_OLLAMA_MAX_RETRIES=2` with `PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC=0.75`
-- `PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6` (stops submitting new requests when the server is unhealthy)
-
-YOLO model weights are downloaded at runtime on first YOLO use to:
-- `~/.cache/pickinsta/models/yolov8n.pt`
-
-Override model path with:
-- `PICKINSTA_YOLO_MODEL=/absolute/path/to/model.pt`
-
-## Run
-
-From the project folder (with venv active):
+### Common commands
 
 ```bash
-mkdir -p ./input ./selected
+# Local/free scoring
 pickinsta ./input --output ./selected --top 10 --scorer clip
+
+# Claude scoring for all technically qualified images
+pickinsta ./input --output ./selected --scorer claude --all
+
+# Claude scoring on pre-cropped 4:5 candidates
+pickinsta ./input --output ./selected --scorer claude --all --claude-crop-first
+
+# Ollama scoring against a local or remote server
+pickinsta ./input --output ./selected --scorer ollama --all
+
+# Use a separate work folder
+pickinsta ./input --output ./selected --work ./work --scorer clip
+
+# Re-run vision scoring without using cached scorer results
+pickinsta ./input --output ./selected --scorer claude --rescore
+
+# Deduplicate only; no ranking or vision scoring
+pickinsta ./input --output ./deduped --dedup-only
 ```
 
-Or as a module:
-
-```bash
-python -m pickinsta ./input --output ./selected --top 10 --scorer claude
-```
-
-Show full CLI options:
+### Help
 
 ```bash
 pickinsta -h
 ```
 
-To score all Stage 2 images (CLIP, Claude, or Ollama), use `--all` instead of the `--vision-pct` cutoff:
+## CLI Surface
 
-```bash
-pickinsta ./input --output ./selected --scorer claude --all
-# or
-pickinsta ./input --output ./selected --scorer clip --all
-# or
-pickinsta ./input --output ./selected --scorer ollama --all
+Current flags implemented in [`src/pickinsta/ig_image_selector.py`](/home/renatobo/devel/pickinsta/src/pickinsta/ig_image_selector.py):
+
+- `input`: source folder of event photos
+- `--output`, `-o`: output folder, default `selected`
+- `--work`, `-w`: intermediate work folder, default `<input>_work`
+- `--top`, `-n`: number of ranked outputs, default `10`
+- `--scorer`, `-s`: `clip`, `claude`, or `ollama`
+- `--vision-pct`: fraction of technically scored images passed to vision scoring, default `0.5`
+- `--all`: score all Stage 2 candidates
+- `--claude-model`: override Claude model
+- `--claude-crop-first`: pre-crop to 1080x1440 before Claude scoring
+- `--rescore`: ignore cached vision results
+- `--dedup-only`: emit unique-image outputs after dedup without ranking
+
+## Pipeline Overview
+
+![pickinsta high-level pipeline](docs/assets/pipeline-high-level.svg)
+
+High-level stages:
+
+1. Stage 0: resize inputs into a work folder with EXIF-safe handling.
+2. Stage 1: deduplicate bursts with perceptual hash, histogram checks, temporal grouping, and feature verification.
+3. Stage 2: compute technical quality metrics.
+4. Stage 3: run the selected vision scorer on the top technical candidates or all candidates.
+5. Stage 4: generate 1080x1440 smart crops, plus HD and full variants.
+6. Finalize ranked reports and an HTML gallery.
+
+Score blend:
+
+```text
+final_score = 0.3 * technical_composite + 0.7 * vision_normalized
 ```
 
-For Claude, you can score on pre-cropped 4:5 candidates to better align
-ranking with final portrait output quality:
+## Outputs
 
-```bash
-pickinsta ./input --output ./selected --scorer claude --all --claude-crop-first
-```
+For each selected image, `pickinsta` writes:
 
-Benchmark Ollama with and without YOLO context (writes Markdown findings report):
+- `NN_cropped_<stem>.jpg`: ranked 1080x1440 portrait output
+- `NN_hd_<stem>.jpg`: resized work-copy version
+- `NN_full_<stem>.<ext>`: original source file copy
 
-```bash
-.venv/bin/python tests/benchmarks/benchmark_ollama_yolo.py \
-  --input ./input \
-  --runs 2 \
-  --all \
-  --report docs/ollama-yolo-benchmark-report.md
-```
+Per-run artifacts:
 
-Benchmark multiple Ollama models for processing speed (manual comparison report):
+- `selection_report.json`: machine-readable summary of selected outputs
+- `selection_report.md`: human-readable report including analyzed image scores
+- `index.html`: browsable local gallery
+
+Crop uncertainty is tracked in the reports. When the crop pipeline falls back or detects a risky crop, those reasons are preserved in report metadata and surfaced in the gallery.
+
+## Caching
+
+- Claude vision responses are cached beside the original input image as `<filename>.pickinsta.json`.
+- Technical scoring is cached in the work folder as `<filename>.<ext>.techscore.json`.
+- `--rescore` bypasses cached vision results.
+- Changing prompt context or model selection can invalidate or bypass prior cache reuse, depending on scorer path and settings.
+
+## Scorer Notes
+
+### CLIP
+
+- Runs locally.
+- Requires first-run model downloads from Hugging Face.
+- `HF_TOKEN` is optional but helps avoid rate limits and warnings.
+
+### Claude
+
+- Requires `ANTHROPIC_API_KEY`.
+- Default model is `claude-haiku-4-5-20251001` unless overridden.
+- `--claude-crop-first` is useful when final 4:5 crop quality should affect ranking more strongly.
+
+### Ollama
+
+- Requires a reachable Ollama server and a pulled vision model.
+- Defaults are tuned for remote inference rather than maximum local parallelism.
+- See [`docs/ollama-server-setup.md`](/home/renatobo/devel/pickinsta/docs/ollama-server-setup.md) for setup and tuning guidance.
+
+## Benchmarks
+
+Manual benchmark scripts live in `tests/benchmarks/`.
+
+Benchmark multiple Ollama models:
 
 ```bash
 .venv/bin/python tests/benchmarks/benchmark_ollama_models.py \
@@ -217,48 +251,37 @@ Benchmark multiple Ollama models for processing speed (manual comparison report)
   --report docs/ollama-model-speed-benchmark-report.md
 ```
 
-Reports are written to `./selected`:
-- `selection_report.json` (top selected outputs)
-- `selection_report.md` (top outputs + full technical and vision scores for all analyzed images)
-
-Output files:
-- `NN_<image-stem>.jpg` (always, ranked crop output)
-- `NN_full_<image-stem>.jpg` (optional, only when crop uncertainty is detected: subject too large/clipped/too close to borders)
-
-Claude caching:
-- Claude responses are cached per original input image file.
-- Cache file format: `<original_filename>.pickinsta.json` in the same input folder.
-  Example: `IMG_1234.jpg.pickinsta.json`
-- Cache validity includes image content hash + Claude model + prompt hash.
-
-## Running tests
-
-Run the full automated test suite:
+Benchmark Ollama with and without YOLO context:
 
 ```bash
-make test
+.venv/bin/python tests/benchmarks/benchmark_ollama_yolo.py \
+  --input ./input \
+  --runs 2 \
+  --all \
+  --report docs/ollama-yolo-benchmark-report.md
 ```
 
-Run a specific test file:
+Related documentation:
 
-```bash
-.venv/bin/pytest -q tests/test_scoring_and_reports.py
-```
+- [`docs/model-quality-speed-comparison.md`](/home/renatobo/devel/pickinsta/docs/model-quality-speed-comparison.md)
+- [`docs/ollama-model-speed-benchmark-report-serverone.md`](/home/renatobo/devel/pickinsta/docs/ollama-model-speed-benchmark-report-serverone.md)
 
-Lint code:
+## Development
 
 ```bash
 make lint
-```
-
-Run both lint + tests:
-
-```bash
+make test
 make check
+make pre-commit-install
 ```
 
-See detailed test coverage notes in `tests/README.md`.
+See [`tests/README.md`](/home/renatobo/devel/pickinsta/tests/README.md) for test coverage notes.
 
-## Contributing
+## Documentation
 
-See `CONTRIBUTING.md` for development workflow, PR expectations, and project layout.
+Primary docs live under [`docs/`](/home/renatobo/devel/pickinsta/docs):
+
+- [`docs/README.md`](/home/renatobo/devel/pickinsta/docs/README.md): documentation index
+- [`docs/composition-rules.md`](/home/renatobo/devel/pickinsta/docs/composition-rules.md): scoring and crop rubric
+- [`docs/troubleshooting.md`](/home/renatobo/devel/pickinsta/docs/troubleshooting.md): install/runtime troubleshooting
+- [`docs/ollama-server-setup.md`](/home/renatobo/devel/pickinsta/docs/ollama-server-setup.md): self-hosted Ollama setup and tuning
