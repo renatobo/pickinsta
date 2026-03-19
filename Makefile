@@ -5,7 +5,7 @@ PIP ?= $(PYTHON) -m pip
 
 install-dev:
 	$(PIP) install --upgrade pip setuptools
-	$(PIP) install -e ".[dev]"
+	$(PIP) install -e ".[dev,clip,claude,yolo]"
 
 test:
 	$(PYTHON) -m pytest
