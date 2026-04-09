@@ -54,7 +54,8 @@ The core pipeline in `src/pickinsta/ig_image_selector.py` processes images throu
 **Three-Scorer Architecture**:
 - **CLIP** (`--scorer clip`): Free, local, zero-shot classification. Uses 4 positive + 2 negative prompts. Maps logits to 0-60 scale to match Claude's range.
 - **Claude** (`--scorer claude`): Default model `claude-haiku-4-5-20251001`. Images downsized to 1024px/q75 before API call to reduce token cost. Scores 6 criteria (subject_clarity, lighting, color_pop, emotion, scroll_stop, crop_4x5). Returns JSON with scores + one-line summary. Brand bonus: Ducati bikes get +2 on subject_clarity and emotion.
-- **Ollama** (`--scorer ollama`): Self-hosted vision scoring with the same 0-60 rubric. Supports retry/backoff, circuit breaker, and configurable request concurrency.
+- **Ollama** (`--scorer ollama`): Self-hosted vision scoring with the same 0-60 rubric. Supports retry/backoff, circuit breaker, and configurable request concurrency. Supported model families: `qwen2.5vl` and `gemma4`. Both use a compact JSON prompt + strict schema; other models get a generic JSON prompt.
+  - **Gemma 4 workaround**: Ollama bug [#15260](https://github.com/ollama/ollama/issues/15260) — `think=false` + `format` parameter causes structured output to be silently ignored. For `gemma4:*` models, the `think` key is **omitted entirely** from the payload. Also uses `temperature=0.3` (vs 0 for other models). Token budget 280 (vs 512 for Qwen, 220 default).
 
 **Final Score Calculation**: `final_score = 0.3 * technical_composite + 0.7 * vision_normalized`
 
@@ -90,7 +91,7 @@ Smart cropping uses these rules to:
 1. Classify shot type (close-up, medium, environmental, scenic, extreme_wide) from subject area
 2. Guess facing direction (left/right/head-on) using horizontal Sobel gradient
 3. Generate candidate crop windows respecting lead room (60-70% space ahead of subject)
-4. Score each candidate on: power point placement (40%), lead room (35%), subject not clipped (25%)
+4. Score each candidate on: subject not clipped (55%), power point placement (15%), lead room (15%), edge breathing room (15%)
 
 ## Development Commands
 

@@ -36,6 +36,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -80,6 +81,8 @@ OLLAMA_QWEN_NUM_PREDICT_SMALL_EDGE = 650
 OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE = 750
 OLLAMA_QWEN_SMALL_EDGE_THRESHOLD = 512
 OLLAMA_QWEN_MODEL_PREFIXES = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl")
+OLLAMA_GEMMA4_MODEL_PREFIXES = ("gemma4",)
+OLLAMA_GEMMA4_NUM_PREDICT = 280  # Gemma 4 JSON output is slightly more verbose than default
 YOLO_MODEL_FILENAME = "yolov8n.pt"
 YOLO_MODEL_URL = "https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt"
 YOLO_MODEL_ENV_VAR = "PICKINSTA_YOLO_MODEL"
@@ -95,6 +98,7 @@ CROP_UNCERTAIN_EDGE_GAP_RATIO = 0.02
 CROP_UNCERTAIN_EDGE_GAP_MIN_PX = 8
 
 _YOLO_MODEL = None
+_YOLO_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +512,7 @@ def write_markdown_report(
             f"{row.get('final_score', '')} | "
             f"{row.get('technical_composite', '')} | "
             f"{row.get('vision_total', '')} | "
-            f"{_md_escape(row.get('output', ''))} | "
+            f"{_md_escape(row.get('output_cropped', ''))} | "
             f"{_md_escape(row.get('one_line', ''))} |"
         )
 
@@ -608,10 +612,19 @@ def resize_for_processing(
     ]
     print(f"📁 Found {len(src_images)} images in {src_folder}")
 
-    # Separate cached vs needs-resize
+    # Separate cached vs needs-resize; disambiguate same-stem sources (e.g. photo.jpg + photo.png)
     to_resize: list[tuple[Path, Path]] = []
+    stems_seen: dict[str, int] = {}
     for img_path in src_images:
-        dest = work_folder / f"{img_path.stem}.jpg"
+        stem = img_path.stem
+        if stem in stems_seen:
+            stems_seen[stem] += 1
+            dest_stem = f"{stem}_{stems_seen[stem]}"
+            print(f"  ⚠ Stem collision: '{img_path.name}' → work file '{dest_stem}.jpg'")
+        else:
+            stems_seen[stem] = 0
+            dest_stem = stem
+        dest = work_folder / f"{dest_stem}.jpg"
         if dest.exists() and dest.stat().st_mtime >= img_path.stat().st_mtime:
             resized.append(dest)
             source_map[dest] = img_path
@@ -649,6 +662,7 @@ def resize_for_processing(
 
 HIST_DEDUP_THRESHOLD = 0.92  # histogram correlation; higher = stricter
 HIST_DEDUP_TEMPORAL_THRESHOLD = 0.80  # relaxed threshold when EXIF timestamps are close
+HIST_DEDUP_TEMPORAL_ORB_THRESHOLD = 0.60  # further relaxed when temporal + strong ORB match
 HIST_DEDUP_THUMB_SIZE = (256, 256)
 BURST_MAX_INTERVAL_SEC = 3.0  # max seconds between shots to consider them a burst
 ORB_MATCH_THRESHOLD = 0.25  # minimum ORB good-match ratio to confirm burst membership
@@ -704,7 +718,8 @@ def _compute_phash(img_path: Path) -> Optional[tuple[Path, object]]:
     """Compute perceptual hash for one image. For ProcessPoolExecutor."""
     try:
         import imagehash
-        h = imagehash.phash(Image.open(img_path), hash_size=16)
+        with Image.open(img_path) as _im:
+            h = imagehash.phash(_im, hash_size=16)
         return (img_path, h)
     except Exception:
         return None
@@ -766,6 +781,9 @@ def deduplicate(
     representative to the full list of burst members (only for groups > 1).
     Initial representative is selected by sharpness (Laplacian variance).
     """
+    if not images:
+        return [], {}
+
     from concurrent.futures import ProcessPoolExecutor
 
     n_workers = min(len(images), os.cpu_count() or 4)
@@ -816,7 +834,7 @@ def deduplicate(
         hash_removed += len(group) - 1
 
     # Pass 2: compute histogram + EXIF + sharpness in parallel for burst detection
-    img_data: list[tuple[Path, Optional[np.ndarray], Optional[float], float]] = []
+    img_data: list[tuple[Path, Optional[np.ndarray], Optional[float], float, Optional[np.ndarray]]] = []
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
         img_data = list(pool.map(_compute_dedup_features, hash_unique))
 
@@ -832,7 +850,6 @@ def deduplicate(
         placed = False
         for group in raw_burst_groups:
             last_path, last_hist, last_ts, _, last_orb = group[-1]
-            first_path, first_hist, first_ts, _, first_orb = group[0]
 
             # Must be temporally close to the last member (chaining)
             if ts is not None and last_ts is not None:
@@ -854,7 +871,7 @@ def deduplicate(
             if is_temporal and orb_ratio >= ORB_MATCH_THRESHOLD:
                 # Strong ORB match + temporal proximity: very lenient histogram
                 # (exposure can shift between burst frames)
-                if corr_last < 0.60:
+                if corr_last < HIST_DEDUP_TEMPORAL_ORB_THRESHOLD:
                     continue
             elif is_temporal:
                 if corr_last < HIST_DEDUP_TEMPORAL_THRESHOLD:
@@ -1237,7 +1254,7 @@ def _save_tech_cache(img_path: Path, tech: dict) -> None:
 
 
 def _score_technical_with_cache(img_path: Path) -> Optional[tuple[Path, dict]]:
-    """Score one image technically, with cache. For use in ProcessPoolExecutor."""
+    """Score one image technically, with cache. For use in ThreadPoolExecutor."""
     try:
         cached = _load_tech_cache(img_path)
         if cached is not None:
@@ -1253,6 +1270,9 @@ def batch_technical_score(
     images: list[Path], source_map: Optional[dict[Path, Path]] = None
 ) -> list[ImageScore]:
     """Score all images technically using multiple threads and return sorted list."""
+    if not images:
+        return []
+
     from concurrent.futures import ThreadPoolExecutor
 
     results = []
@@ -1370,6 +1390,35 @@ Rules:
 - BRAND BONUS: This is a Ducati-focused account. If the motorcycle is identifiably a Ducati, add 2 bonus points to subject_clarity and emotion (max 10 each). All other brands or unidentifiable bikes score normally — do NOT penalize them.
 """
 
+OLLAMA_GEMMA4_JSON_PROMPT_TEMPLATE = """Evaluate this motorcycle photo for Instagram cover potential.
+
+Context: {account_context}.
+
+Score each criterion INDEPENDENTLY as an integer 0-10. Each criterion measures something different — it is normal and expected for scores to vary across criteria.
+
+Criteria:
+- subject_clarity: sharpness, framing, visual dominance of the subject
+- lighting: exposure balance, no blown highlights, no crushed shadows
+- color_pop: vividness, contrast, visual impact of colors
+- emotion: sense of speed, drama, excitement, or atmosphere
+- scroll_stop: would a viewer stop scrolling past this in a feed?
+- crop_4x5: how well the subject fills a 4:5 portrait crop
+
+Score anchors: 1-3=poor, 4-5=mediocre, 6-7=good, 8-9=excellent, 10=exceptional.
+
+Example of correctly differentiated scoring (do NOT copy these numbers — score what you actually see):
+subject_clarity=8, lighting=4, color_pop=7, emotion=9, scroll_stop=6, crop_4x5=5
+(High emotion and sharp subject, but poor lighting and awkward crop. Different criteria = different scores.)
+
+total = exact integer sum of all 6 scores.
+
+one_line: A single sentence starting with what the subject is doing or looks like in this specific image. No preamble. Example: "A red Ducati leans hard through a sun-lit hairpin with blurred background."
+
+BRAND BONUS: Ducati identifiable → add 2 to subject_clarity and emotion (max 10 each). Other brands: score normally.
+
+Return ONLY valid JSON with keys: subject_clarity, lighting, color_pop, emotion, scroll_stop, crop_4x5, total, one_line.
+"""
+
 OLLAMA_STRICT_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1417,6 +1466,16 @@ def build_ollama_compact_json_prompt(account_context: str) -> str:
     return OLLAMA_COMPACT_JSON_PROMPT_TEMPLATE.format(account_context=context)
 
 
+def build_ollama_gemma4_prompt(account_context: str) -> str:
+    """Build per-criterion rubric prompt for Gemma 4 models.
+
+    Uses distinct criterion definitions and score anchors to prevent the
+    quantized-score collapse seen with the compact prompt on small models.
+    """
+    context = account_context.strip() or DEFAULT_ACCOUNT_CONTEXT
+    return OLLAMA_GEMMA4_JSON_PROMPT_TEMPLATE.format(account_context=context)
+
+
 def _extract_account_context_from_prompt(prompt_text: str) -> str:
     """Best-effort extraction of account context from a full vision prompt."""
     text = (prompt_text or "").strip()
@@ -1440,13 +1499,35 @@ def _is_qwen_ollama_model(model: str) -> bool:
     return any(normalized.startswith(prefix) for prefix in OLLAMA_QWEN_MODEL_PREFIXES)
 
 
+def _is_gemma4_ollama_model(model: str) -> bool:
+    """Identify Gemma 4 models.
+
+    Gemma 4 requires the `think` key to be omitted entirely when using the `format`
+    parameter — setting think=false breaks structured output (Ollama bug #15260).
+    Also uses a slightly higher temperature per Google's recommendations.
+    """
+    normalized = (model or "").strip().lower()
+    return any(normalized.startswith(prefix) for prefix in OLLAMA_GEMMA4_MODEL_PREFIXES)
+
+
 def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
     """Choose a model-aware token budget for Ollama responses."""
     if _is_qwen_ollama_model(model):
         if max_image_edge <= OLLAMA_QWEN_SMALL_EDGE_THRESHOLD:
             return OLLAMA_QWEN_NUM_PREDICT_SMALL_EDGE
         return OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
+    if _is_gemma4_ollama_model(model):
+        return OLLAMA_GEMMA4_NUM_PREDICT
     return OLLAMA_DEFAULT_NUM_PREDICT
+
+
+_THINKING_PREAMBLE_RE = re.compile(
+    r"(?i)^(?:"
+    r"here[\u2019']?s a (?:thinking|step-by-step|reasoning)[^.]*\.\s*\d*\.?\s*"
+    r"|(?:let me|i will|i'll|i need to) (?:analyze|think|evaluate|assess|review|examine)[^.]*\.\s*"
+    r"|(?:step|thought|thinking)[\s:]+\d+[.:]\s*"
+    r")"
+)
 
 
 def _sanitize_vision_one_line(raw_value: object, *, fallback_text: str = "") -> str:
@@ -1461,6 +1542,14 @@ def _sanitize_vision_one_line(raw_value: object, *, fallback_text: str = "") -> 
         line = line[1:].strip()
     if line.endswith(("'", '"')):
         line = line[:-1].strip()
+
+    # Strip model thinking-chain preambles (e.g. Gemma 4's "Here's a thinking process...")
+    stripped = _THINKING_PREAMBLE_RE.sub("", line).strip()
+    if len(stripped) >= 20:
+        line = stripped
+    elif _THINKING_PREAMBLE_RE.match(line):
+        line = ""
+
     return line[:220] if line else "Vision scoring summary"
 
 
@@ -1842,16 +1931,21 @@ def score_with_ollama(
     if yolo_context:
         base_prompt = base_prompt + yolo_context
 
+    _is_gemma4 = _is_gemma4_ollama_model(model)
+
     def _send_ollama_request(*, active_prompt: str, response_format: object, num_predict: int) -> tuple[str, dict]:
-        payload = {
+        # Gemma 4: omit `think` entirely — setting think=false breaks `format` (Ollama bug #15260)
+        # Gemma 4: use temperature=0.3 per Google's recommendations for more reliable output
+        payload: dict = {
             "model": model,
             "stream": False,
-            "think": False,
             "format": response_format,
             "keep_alive": keep_alive,
-            "options": {"temperature": 0, "num_predict": num_predict},
+            "options": {"temperature": 0.3 if _is_gemma4 else 0, "num_predict": num_predict},
             "messages": [{"role": "user", "content": active_prompt, "images": [image_data]}],
         }
+        if not _is_gemma4:
+            payload["think"] = False
         request = Request(
             endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -1874,10 +1968,14 @@ def score_with_ollama(
             raise RuntimeError(f"Ollama connection failed for {endpoint}: {error}") from error
         return body, json.loads(body)
 
-    use_qwen_profile = _is_qwen_ollama_model(model)
-    if use_qwen_profile:
+    _is_gemma4 = _is_gemma4_ollama_model(model)
+    use_structured_profile = _is_qwen_ollama_model(model) or _is_gemma4
+    if use_structured_profile:
         account_context = _extract_account_context_from_prompt(base_prompt)
-        primary_prompt = build_ollama_compact_json_prompt(account_context)
+        if _is_gemma4:
+            primary_prompt = build_ollama_gemma4_prompt(account_context)
+        else:
+            primary_prompt = build_ollama_compact_json_prompt(account_context)
         if yolo_context:
             primary_prompt = primary_prompt + yolo_context
         primary_format: object = OLLAMA_STRICT_JSON_SCHEMA
@@ -1896,7 +1994,10 @@ def score_with_ollama(
     # Retry once when first pass degraded into plain/neutral fallback output.
     if parse_mode.startswith("plain-") or parse_mode.startswith("neutral-"):
         retry_context = _extract_account_context_from_prompt(base_prompt)
-        retry_prompt = build_ollama_compact_json_prompt(retry_context)
+        if _is_gemma4:
+            retry_prompt = build_ollama_gemma4_prompt(retry_context)
+        else:
+            retry_prompt = build_ollama_compact_json_prompt(retry_context)
         if yolo_context:
             retry_prompt = retry_prompt + yolo_context
         retry_body, retry_parsed = _send_ollama_request(
@@ -2449,18 +2550,21 @@ def resolve_yolo_model_path(debug: bool = False) -> Path:
 
 
 def _load_yolo_model(debug: bool = False):
-    """Load and cache YOLO model instance."""
+    """Load and cache YOLO model instance. Thread-safe via _YOLO_LOCK."""
     global _YOLO_MODEL
     if _YOLO_MODEL is not None:
         return _YOLO_MODEL
 
-    import logging
-    os.environ.setdefault("YOLO_VERBOSE", "false")
-    logging.getLogger("ultralytics").setLevel(logging.WARNING)
-    from ultralytics import YOLO
+    with _YOLO_LOCK:
+        if _YOLO_MODEL is not None:  # re-check after acquiring lock
+            return _YOLO_MODEL
+        import logging
+        os.environ.setdefault("YOLO_VERBOSE", "false")
+        logging.getLogger("ultralytics").setLevel(logging.WARNING)
+        from ultralytics import YOLO
 
-    model_path = resolve_yolo_model_path(debug=debug)
-    _YOLO_MODEL = YOLO(str(model_path), task="detect", verbose=False)
+        model_path = resolve_yolo_model_path(debug=debug)
+        _YOLO_MODEL = YOLO(str(model_path), task="detect", verbose=False)
     return _YOLO_MODEL
 
 
@@ -3542,8 +3646,7 @@ def run_dedup_only(
         if alt_paths:
             n_workers = min(len(alt_paths), os.cpu_count() or 4)
             with _TPEb(max_workers=n_workers) as pool:
-                for result in zip(alt_paths, pool.map(_score_technical_with_cache, alt_paths)):
-                    path, res = result
+                for _, res in zip(alt_paths, pool.map(_score_technical_with_cache, alt_paths)):
                     if res is not None:
                         alt_scores[res[0]] = res[1]
         # Also score the representatives
@@ -3685,6 +3788,20 @@ def run_dedup_only(
     print(f"{'=' * 60}")
 
 
+_SHARED_HEADER_CSS = """\
+  .brand { color: var(--accent); font-size: 1.35rem; font-weight: 700; letter-spacing: -.02em; }
+  .page-title { font-size: 1.2rem; font-weight: 600; letter-spacing: -.02em; }
+  .gh-link { color: var(--text-dim); transition: color .15s; }
+  .gh-link:hover { color: var(--text); }
+  .breadcrumb {
+    display: inline-flex; align-items: baseline; flex-wrap: wrap;
+    gap: .15rem; font-size: .95rem; color: var(--text-dim);
+  }
+  .breadcrumb a { color: var(--text-dim); text-decoration: none; }
+  .breadcrumb a:hover { color: var(--text); text-decoration: underline; }
+  .breadcrumb .sep { margin: 0 .3rem; }\
+"""
+
 _DEDUP_GALLERY_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
@@ -3699,8 +3816,8 @@ _DEDUP_GALLERY_TEMPLATE = """\
   body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     background: var(--bg); color: var(--text); line-height: 1.5; }}
   header {{ padding: 1rem 2rem; border-bottom: 1px solid var(--border); background: var(--surface); }}
-  header h1 {{ font-size: 1.3rem; font-weight: 600; display: flex; align-items: center; gap: .5rem; }}
-  header h1 span {{ color: var(--accent); }}
+  header h1 {{ font-size: 1rem; font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; gap: .45rem; }}
+{shared_header_css}
   .info {{ padding: .5rem 2rem; font-size: .8rem; color: var(--text-dim); border-bottom: 1px solid var(--border); background: var(--surface); }}
   .layout {{ display: flex; height: calc(100vh - 80px); }}
   .grid-panel {{ flex: 1; overflow-y: auto; padding: .75rem; }}
@@ -3728,7 +3845,7 @@ _DEDUP_GALLERY_TEMPLATE = """\
 </style>
 </head>
 <body>
-<header><h1><span>pickinsta</span> {title} &mdash; dedup</h1></header>
+<header><h1><span class="brand">pickinsta</span> <span class="page-title">{title} &mdash; dedup</span></h1></header>
 <div class="info">{count} unique images</div>
 <div class="layout">
   <div class="grid-panel"><div class="grid" id="grid">{tiles}</div></div>
@@ -3809,6 +3926,7 @@ def _generate_dedup_gallery(output_folder: Path, items: list[dict]) -> None:
         count=len(items),
         tiles=tiles,
         json_data=json.dumps(json_items, indent=None),
+        shared_header_css=_SHARED_HEADER_CSS,
     )
     (output_folder / "index.html").write_text(html, encoding="utf-8")
 
@@ -3935,8 +4053,7 @@ def run_pipeline(
         if alt_paths:
             n_workers = min(len(alt_paths), os.cpu_count() or 4)
             with _TPE2b(max_workers=n_workers) as pool:
-                for result in zip(alt_paths, pool.map(_score_technical_with_cache, alt_paths)):
-                    path, res = result
+                for _, res in zip(alt_paths, pool.map(_score_technical_with_cache, alt_paths)):
                     if res is not None:
                         alt_scores[res[0]] = res[1]
         # Pick the best from each burst group
@@ -4164,215 +4281,348 @@ _GALLERY_HTML_TEMPLATE = """\
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,600;1,9..144,300&display=swap" rel="stylesheet">
 <style>
   :root {{
-    --bg: #0f0f0f;
-    --surface: #1a1a1a;
-    --surface2: #242424;
-    --border: #333;
-    --text: #e0e0e0;
-    --text-dim: #888;
-    --accent: #d32f2f;
-    --accent-dim: #b71c1c;
-    --gold: #ffd54f;
+    --bg: #080808;
+    --surface: #0d0d0d;
+    --surface2: #141414;
+    --surface3: #1c1c1c;
+    --border: #1f1f1f;
+    --border2: #2a2a2a;
+    --text: #bdbdbd;
+    --text-bright: #e8e8e8;
+    --text-dim: #424242;
+    --accent: #c8251d;
+    --accent-dim: #7a1510;
+    --accent-glow: rgba(200,37,29,.18);
+    --gold: #d4a73a;
+    --gold-dim: rgba(212,167,58,.15);
+    --cyan: #4fc3c8;
+    --panel-w: 480px;
+    --header-h: 48px;
+    --bar-h: 36px;
+    --font-mono: 'DM Mono', 'SF Mono', 'Fira Code', monospace;
+    --font-display: 'Bebas Neue', 'Impact', sans-serif;
+    --font-editorial: 'Fraunces', Georgia, serif;
   }}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  html, body {{ height: 100%; overflow: hidden; }}
   body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: var(--font-mono);
     background: var(--bg); color: var(--text);
-    line-height: 1.5;
+    line-height: 1.5; font-size: 13px;
   }}
+
+  /* ── Header ── */
   header {{
-    padding: 1rem 2rem;
-    border-bottom: 1px solid var(--border);
+    height: var(--header-h);
+    padding: 0 1.25rem;
+    display: flex; align-items: center;
     background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: relative; z-index: 10;
+    gap: .75rem;
   }}
-  header {{
-    padding: 1rem 2rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
+  header::after {{
+    content: '';
+    position: absolute; bottom: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, var(--accent) 0%, transparent 60%);
   }}
   header h1 {{
-    font-size: 1.3rem; font-weight: 600;
-    display: flex; align-items: center; gap: .5rem;
+    display: flex; align-items: baseline; flex-wrap: wrap;
+    gap: .4rem; flex: 1;
   }}
-  header h1 span {{ color: var(--accent); }}
+{shared_header_css}
+  .brand {{
+    font-family: var(--font-editorial);
+    font-size: 1.25rem; font-weight: 600;
+    color: var(--accent); letter-spacing: -.01em;
+    line-height: 1;
+  }}
+  .page-title {{
+    font-family: var(--font-mono);
+    font-size: .7rem; font-weight: 400;
+    color: var(--text-dim); letter-spacing: .06em;
+    text-transform: uppercase;
+  }}
   .gh-link {{
-    color: var(--text-dim); transition: color .15s;
+    color: var(--text-dim); transition: color .2s; flex-shrink: 0;
+    display: flex; align-items: center;
   }}
   .gh-link:hover {{ color: var(--text); }}
-  .breadcrumb {{ display: inline; font-size: .85rem; color: var(--text-dim); }}
+  .breadcrumb {{
+    display: inline-flex; align-items: baseline; flex-wrap: wrap;
+    gap: 0; font-size: .7rem; color: var(--text-dim);
+    letter-spacing: .04em; text-transform: uppercase;
+  }}
   .breadcrumb a {{ color: var(--text-dim); text-decoration: none; }}
-  .breadcrumb a:hover {{ color: var(--text); text-decoration: underline; }}
-  .breadcrumb .sep {{ margin: 0 .3rem; }}
-  .summary {{
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
+  .breadcrumb a:hover {{ color: var(--text); }}
+  .breadcrumb .sep {{ margin: 0 .2rem; opacity: .4; }}
+
+  /* ── Stats bar ── */
+  .stats-bar {{
+    height: var(--bar-h);
+    display: flex; align-items: stretch;
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    overflow-x: auto; overflow-y: hidden;
   }}
-  .summary-toggle {{
-    display: block; width: 100%; padding: .5rem 2rem;
-    background: none; border: none; color: var(--text-dim);
-    font-size: .8rem; cursor: pointer; text-align: left;
+  .stat {{
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 0 1.25rem; border-right: 1px solid var(--border);
+    white-space: nowrap; flex-shrink: 0;
   }}
-  .summary-toggle:hover {{ color: var(--text); }}
-  .summary-body {{
-    display: none; padding: 0 2rem .75rem;
+  .stat-label {{
+    font-size: .55rem; color: var(--text-dim);
+    text-transform: uppercase; letter-spacing: .1em; line-height: 1;
   }}
-  .summary.open .summary-body {{ display: block; }}
-  .summary-grid {{
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: .5rem;
+  .stat-value {{
+    font-family: var(--font-display);
+    font-size: .95rem; color: var(--text-bright);
+    line-height: 1.1; letter-spacing: .02em;
   }}
-  .stat {{ background: var(--surface2); border-radius: 6px; padding: .4rem .6rem; }}
-  .stat-label {{ font-size: .65rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .05em; }}
-  .stat-value {{ font-size: 1rem; font-weight: 600; }}
+
+  /* ── Layout ── */
   .layout {{
-    display: flex; height: calc(100vh - 85px);
+    display: flex;
+    height: calc(100vh - var(--header-h) - var(--bar-h));
   }}
+
+  /* ── Grid panel ── */
   .grid-panel {{
-    flex: 1; overflow-y: auto; padding: .75rem;
+    flex: 1; overflow-y: auto; padding: .6rem;
+    position: relative;
   }}
   .grid {{
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: .5rem;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: .4rem;
   }}
+
+  /* ── Tile ── */
   .tile {{
-    position: relative; cursor: pointer;
-    border-radius: 6px; overflow: hidden;
-    border: 2px solid transparent;
-    transition: border-color .15s, transform .15s;
+    position: relative; cursor: pointer; overflow: hidden;
+    border-radius: 3px;
+    outline: 1px solid var(--border);
+    outline-offset: 0;
+    transition: outline-color .15s, transform .15s;
   }}
-  .tile:hover {{ border-color: var(--accent); transform: scale(1.02); }}
-  .tile.active {{ border-color: var(--gold); }}
+  .tile:hover {{ outline-color: var(--accent); transform: scale(1.025); z-index: 2; }}
+  .tile.active {{ outline: 2px solid var(--gold); outline-offset: 0; }}
   .tile img {{
     width: 100%; aspect-ratio: 3/4; object-fit: cover; display: block;
   }}
+  .tile-overlay {{
+    position: absolute; inset: 0;
+    background: linear-gradient(
+      to bottom,
+      rgba(0,0,0,.55) 0%,
+      transparent 35%,
+      transparent 65%,
+      rgba(0,0,0,.65) 100%
+    );
+    pointer-events: none;
+  }}
   .tile-rank {{
-    position: absolute; top: 4px; left: 4px;
-    background: rgba(0,0,0,.75); color: var(--gold);
-    font-size: .7rem; font-weight: 700;
-    padding: 1px 6px; border-radius: 4px;
+    position: absolute; top: 4px; left: 5px;
+    font-family: var(--font-display);
+    font-size: 1.4rem; line-height: 1;
+    color: var(--gold);
+    text-shadow: 0 1px 4px rgba(0,0,0,.8);
   }}
   .tile-score {{
-    position: absolute; bottom: 4px; right: 4px;
-    background: rgba(0,0,0,.75); color: var(--text);
-    font-size: .65rem; padding: 1px 5px; border-radius: 4px;
+    position: absolute; bottom: 4px; right: 5px;
+    font-family: var(--font-mono); font-size: .58rem;
+    color: rgba(255,255,255,.7);
+    text-shadow: 0 1px 3px rgba(0,0,0,.9);
   }}
   .tile-uncertain {{
     position: absolute; top: 4px; right: 4px;
-    background: rgba(0,0,0,.75); color: #ff9800;
-    font-size: .8rem; padding: 1px 5px; border-radius: 4px;
+    color: #e67e22; opacity: .9;
+    filter: drop-shadow(0 1px 2px rgba(0,0,0,.8));
   }}
   .tile-burst {{
-    position: absolute; bottom: 4px; left: 4px;
-    background: rgba(0,0,0,.75); color: #81d4fa;
-    font-size: .6rem; padding: 1px 5px; border-radius: 4px;
+    position: absolute; bottom: 4px; left: 5px;
+    font-family: var(--font-mono); font-size: .55rem;
+    color: var(--cyan);
+    text-shadow: 0 1px 3px rgba(0,0,0,.9);
   }}
+
+  /* ── Detail panel ── */
   .detail-panel {{
-    width: 520px; min-width: 520px;
+    width: var(--panel-w); min-width: var(--panel-w);
     overflow-y: auto; background: var(--surface);
     border-left: 1px solid var(--border);
-    padding: 1rem;
-    display: none;
+    display: flex; flex-direction: column;
+    transform: translateX(100%);
+    transition: transform .25s cubic-bezier(.4,0,.2,1);
   }}
-  .detail-panel.open {{ display: flex; flex-direction: column; }}
-  .detail-panel h2 {{
-    font-size: .9rem; font-weight: 600; margin-bottom: .5rem;
-    word-break: break-all; flex-shrink: 0;
+  .detail-panel.open {{
+    transform: translateX(0);
   }}
-  .preview-row {{
-    display: flex; gap: .75rem;
-    flex: 1; min-height: 0; align-items: flex-start;
+  .panel-header {{
+    padding: .75rem 1rem .5rem;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    position: sticky; top: 0; z-index: 5;
+    background: var(--surface);
   }}
-  .preview-col {{
-    flex: 1; display: flex; flex-direction: column;
+  .panel-header h2 {{
+    font-family: var(--font-mono); font-size: .72rem;
+    font-weight: 400; color: var(--text-dim);
+    letter-spacing: .04em; text-transform: uppercase;
+    word-break: break-all; margin-bottom: .3rem;
   }}
-  .preview-col h3 {{
-    font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
-    color: var(--text-dim); margin-bottom: .3rem; flex-shrink: 0;
+  .panel-header h2 strong {{
+    font-family: var(--font-display);
+    font-size: 1.3rem; color: var(--gold);
+    letter-spacing: .04em; font-weight: 400;
+    vertical-align: baseline; margin-right: .25rem;
   }}
   .version-tabs {{
-    display: flex; gap: 3px; margin-bottom: .4rem; flex-shrink: 0;
+    display: flex; gap: 2px;
   }}
   .version-tabs button {{
-    flex: 1; padding: .25rem; font-size: .7rem;
+    flex: 1; padding: .2rem .4rem; font-size: .6rem;
+    font-family: var(--font-mono); letter-spacing: .08em;
+    text-transform: uppercase;
     background: var(--surface2); color: var(--text-dim);
-    border: 1px solid var(--border); border-radius: 4px;
-    cursor: pointer;
+    border: 1px solid var(--border2); border-radius: 2px;
+    cursor: pointer; transition: background .15s, color .15s;
   }}
   .version-tabs button.active {{
     background: var(--accent-dim); color: #fff; border-color: var(--accent);
   }}
-  .preview-img-wrap {{
-    min-height: 0; display: flex; align-items: flex-start;
+  .version-tabs button:hover:not(.active) {{
+    background: var(--surface3); color: var(--text);
+  }}
+
+  /* ── Panel body ── */
+  .panel-body {{
+    flex: 1; display: flex; flex-direction: column;
+    overflow-y: auto;
+  }}
+  .preview-row {{
+    display: flex; gap: .5rem; padding: .6rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }}
+  .preview-col {{
+    flex: 1; display: flex; flex-direction: column; gap: .3rem;
+  }}
+  .preview-col-label {{
+    font-size: .55rem; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--text-dim);
   }}
   .preview-img-wrap img {{
     width: 100%; object-fit: contain;
-    border-radius: 4px; background: var(--surface2);
+    border-radius: 2px; background: var(--surface2);
+    display: block;
   }}
-  .info-strip {{
-    flex-shrink: 0; margin-top: .5rem;
-    display: flex; flex-direction: column; gap: .5rem;
+
+  /* ── Info sections ── */
+  .info-section {{
+    padding: .6rem 1rem; border-bottom: 1px solid var(--border);
   }}
-  .info-strip h3 {{
-    font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
-    color: var(--text-dim); margin-bottom: .2rem;
+  .section-label {{
+    font-size: .55rem; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--text-dim); margin-bottom: .4rem;
   }}
   .one-line {{
-    font-style: italic; color: var(--text-dim);
-    font-size: .8rem; line-height: 1.3;
+    font-family: var(--font-editorial);
+    font-style: italic; color: var(--text);
+    font-size: .85rem; line-height: 1.5;
+    font-weight: 300;
+  }}
+  .exif-chips {{
+    display: flex; flex-wrap: wrap; gap: .25rem;
+  }}
+  .exif-chip {{
+    background: var(--surface2); border: 1px solid var(--border2);
+    border-radius: 2px; padding: .15rem .45rem;
+    font-size: .65rem; color: var(--text);
+    white-space: nowrap;
+  }}
+  .yolo-grid {{
+    display: grid; grid-template-columns: auto 1fr;
+    gap: .15rem .75rem; font-size: .68rem;
+  }}
+  .yolo-grid dt {{ color: var(--text-dim); letter-spacing: .05em; text-transform: uppercase; font-size: .58rem; }}
+  .yolo-grid dd {{ font-weight: 500; color: var(--text-bright); }}
+
+  /* ── Score gauges ── */
+  .score-group-label {{
+    font-size: .55rem; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--text-dim); margin-bottom: .5rem;
   }}
   .score-row {{
-    display: flex; align-items: center; gap: .4rem;
-    margin-bottom: .2rem; font-size: .75rem;
+    display: grid;
+    grid-template-columns: 80px 1fr 36px;
+    align-items: center; gap: .5rem;
+    margin-bottom: .35rem;
   }}
-  .score-label {{ width: 85px; color: var(--text-dim); text-align: right; flex-shrink: 0; }}
-  .score-bar-bg {{
-    flex: 1; height: 12px; background: var(--surface2);
-    border-radius: 3px; overflow: hidden;
+  .score-label {{
+    font-size: .6rem; color: var(--text-dim);
+    text-align: right; letter-spacing: .03em;
+    text-transform: uppercase; white-space: nowrap;
   }}
-  .score-bar {{
-    height: 100%; border-radius: 3px;
+  .score-track {{
+    position: relative; height: 2px;
+    background: var(--surface3);
+  }}
+  .score-fill {{
+    position: absolute; top: 0; left: 0; bottom: 0;
+    background: var(--accent);
+    transition: width .4s cubic-bezier(.4,0,.2,1);
+  }}
+  .score-fill.highlight {{
     background: linear-gradient(90deg, var(--accent-dim), var(--accent));
-    transition: width .3s;
+    box-shadow: 0 0 6px var(--accent-glow);
   }}
-  .score-val {{ width: 26px; text-align: right; font-weight: 600; font-size: .75rem; }}
-  .yolo-grid {{
-    display: grid; grid-template-columns: 1fr 1fr; gap: .2rem .5rem;
-    font-size: .75rem;
+  .score-dot {{
+    position: absolute; top: 50%; right: 0;
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent); border: 1px solid var(--bg);
+    transform: translate(50%, -50%);
+    transition: right .4s cubic-bezier(.4,0,.2,1);
   }}
-  .yolo-grid dt {{ color: var(--text-dim); }}
-  .yolo-grid dd {{ font-weight: 500; }}
-  .exif-row {{
-    display: flex; flex-wrap: wrap; gap: .3rem .75rem;
-    font-size: .75rem; color: var(--text-dim);
+  .score-val {{
+    font-family: var(--font-display);
+    font-size: .9rem; color: var(--text-bright);
+    letter-spacing: .02em; text-align: right;
   }}
-  .exif-row span {{ white-space: nowrap; }}
-  .exif-val {{ color: var(--text); font-weight: 500; }}
-  ::-webkit-scrollbar {{ width: 6px; }}
-  ::-webkit-scrollbar-track {{ background: var(--bg); }}
-  ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
+  .score-divider {{
+    height: 1px; background: var(--border); margin: .4rem 0 .6rem;
+  }}
+
+  /* ── Burst info ── */
+  .burst-info {{
+    display: flex; gap: .75rem; flex-wrap: wrap;
+  }}
+  .burst-chip {{
+    font-size: .68rem; color: var(--cyan);
+  }}
+  .burst-chip span {{ color: var(--text-bright); }}
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar {{ width: 4px; height: 4px; }}
+  ::-webkit-scrollbar-track {{ background: transparent; }}
+  ::-webkit-scrollbar-thumb {{ background: var(--border2); border-radius: 2px; }}
 </style>
 </head>
 <body>
 <header>
   <h1>
     <a class="gh-link" href="https://github.com/renatobo/pickinsta" target="_blank" title="pickinsta on GitHub">
-      <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <svg width="18" height="18" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
     </a>
-    <span>pickinsta</span> {breadcrumb} {title}
+    <span class="brand">pickinsta</span>
+    {breadcrumb}<span class="page-title">{title}</span>
   </h1>
 </header>
-<div class="summary" id="summary">
-  <button class="summary-toggle" onclick="this.parentElement.classList.toggle('open')">
-    Summary &mdash; click to expand
-  </button>
-  <div class="summary-body">
-    <div class="summary-grid">
-      {summary_stats}
-    </div>
-  </div>
+<div class="stats-bar" id="stats-bar">
+  {summary_stats}
 </div>
 <div class="layout">
   <div class="grid-panel">
@@ -4381,39 +4631,41 @@ _GALLERY_HTML_TEMPLATE = """\
     </div>
   </div>
   <div class="detail-panel" id="detail">
-    <h2 id="detail-title"></h2>
-    <div class="version-tabs" id="version-tabs"></div>
-    <div class="preview-row">
-      <div class="preview-col">
-        <h3>Preview</h3>
-        <div class="preview-img-wrap">
-          <a id="version-link" href="" target="_blank"><img id="version-img" src="" alt=""></a>
-        </div>
-      </div>
-      <div class="preview-col" id="yolo-col" style="display:none">
-        <h3>YOLO Detection</h3>
-        <div class="preview-img-wrap">
-          <img id="yolo-img" src="" alt="">
-        </div>
-        <div id="detail-yolo" style="margin-top:.4rem"></div>
-      </div>
+    <div class="panel-header">
+      <h2 id="detail-title"></h2>
+      <div class="version-tabs" id="version-tabs"></div>
     </div>
-    <div class="info-strip">
-      <div id="burst-section" style="display:none">
-        <h3>Burst</h3>
-        <div id="detail-burst" class="exif-row"></div>
+    <div class="panel-body">
+      <div class="preview-row">
+        <div class="preview-col">
+          <div class="preview-col-label">Preview</div>
+          <div class="preview-img-wrap">
+            <a id="version-link" href="" target="_blank"><img id="version-img" src="" alt=""></a>
+          </div>
+        </div>
+        <div class="preview-col" id="yolo-col" style="display:none">
+          <div class="preview-col-label">YOLO</div>
+          <div class="preview-img-wrap">
+            <img id="yolo-img" src="" alt="">
+          </div>
+          <div id="detail-yolo" style="margin-top:.5rem"></div>
+        </div>
       </div>
-      <div id="exif-section" style="display:none">
-        <h3>EXIF</h3>
-        <div id="detail-exif" class="exif-row"></div>
-      </div>
-      <div>
-        <h3>AI Assessment</h3>
+      <div class="info-section" id="ai-section">
+        <div class="section-label">AI Assessment</div>
         <p class="one-line" id="detail-oneline"></p>
       </div>
-      <div>
-        <h3>Scores</h3>
+      <div class="info-section">
+        <div class="section-label">Scores</div>
         <div id="detail-scores"></div>
+      </div>
+      <div class="info-section" id="exif-section" style="display:none">
+        <div class="section-label">EXIF</div>
+        <div class="exif-chips" id="detail-exif"></div>
+      </div>
+      <div class="info-section" id="burst-section" style="display:none">
+        <div class="section-label">Burst</div>
+        <div class="burst-info" id="detail-burst"></div>
       </div>
     </div>
   </div>
@@ -4427,7 +4679,8 @@ function selectImage(idx) {{
   const panel = document.getElementById('detail');
   panel.classList.add('open');
   const d = DATA[idx];
-  document.getElementById('detail-title').textContent = `#${{d.rank}} ${{d.filename}}`;
+  const titleEl = document.getElementById('detail-title');
+  titleEl.innerHTML = `<strong>#${{d.rank}}</strong>${{d.filename}}`;
   document.getElementById('detail-oneline').textContent = d.one_line || '';
   const tabs = document.getElementById('version-tabs');
   const img = document.getElementById('version-img');
@@ -4451,7 +4704,7 @@ function selectImage(idx) {{
     tabs.appendChild(btn);
   }});
   if (versions.length) {{ img.src = versions[0][1]; link.href = versions[0][1]; }}
-  // YOLO column
+  // YOLO
   const yoloCol = document.getElementById('yolo-col');
   const yoloImg = document.getElementById('yolo-img');
   const yoloDiv = document.getElementById('detail-yolo');
@@ -4462,70 +4715,62 @@ function selectImage(idx) {{
     if (d.yolo) {{
       const y = d.yolo;
       let yhtml = '<dl class="yolo-grid">';
-      const fields = [
-        ['Class', y.class_name],
-        ['Conf', y.confidence ? (y.confidence * 100).toFixed(0) + '%' : '\u2014'],
-        ['Shot', y.shot_type],
-        ['Facing', y.facing],
-      ];
-      fields.forEach(([k,v]) => {{ yhtml += `<dt>${{k}}</dt><dd>${{v || '\u2014'}}</dd>`; }});
-      yhtml += '</dl>';
-      yoloDiv.innerHTML = yhtml;
-    }} else {{
-      yoloDiv.innerHTML = '';
-    }}
-  }} else {{
-    yoloCol.style.display = 'none';
-  }}
+      [['Class', y.class_name], ['Conf', y.confidence ? (y.confidence * 100).toFixed(0) + '%' : '\u2014'],
+       ['Shot', y.shot_type], ['Facing', y.facing]].forEach(([k,v]) => {{
+        yhtml += `<dt>${{k}}</dt><dd>${{v || '\u2014'}}</dd>`;
+      }});
+      yoloDiv.innerHTML = yhtml + '</dl>';
+    }} else {{ yoloDiv.innerHTML = ''; }}
+  }} else {{ yoloCol.style.display = 'none'; }}
   // Burst
-  const burstDiv = document.getElementById('detail-burst');
   const burstSection = document.getElementById('burst-section');
+  const burstDiv = document.getElementById('detail-burst');
   if (d.burst && d.burst.count > 1) {{
     burstSection.style.display = 'block';
-    burstDiv.innerHTML = `<span>Best of <span class="exif-val">${{d.burst.count}}</span> shots</span>`
-      + `<span>Selected by <span class="exif-val">${{d.burst.selected_by}}</span></span>`;
-  }} else {{
-    burstSection.style.display = 'none';
-  }}
+    burstDiv.innerHTML =
+      `<span class="burst-chip">Best of <span>${{d.burst.count}}</span> shots</span>` +
+      `<span class="burst-chip">Via <span>${{d.burst.selected_by}}</span></span>`;
+  }} else {{ burstSection.style.display = 'none'; }}
   // EXIF
-  const exifDiv = document.getElementById('detail-exif');
   const exifSection = document.getElementById('exif-section');
+  const exifDiv = document.getElementById('detail-exif');
   if (d.exif && Object.keys(d.exif).length) {{
     exifSection.style.display = 'block';
-    const fields = [
-      ['camera'], ['lens'], ['focal'], ['aperture'], ['shutter'], ['iso'], ['date']
-    ];
+    const fmts = {{ camera: v => v, lens: v => v, focal: v => v + 'mm', aperture: v => 'f/' + v,
+                    shutter: v => v + 's', iso: v => 'ISO ' + v, date: v => v }};
     let ehtml = '';
-    fields.forEach(([k]) => {{
-      if (d.exif[k]) ehtml += `<span><span class="exif-val">${{d.exif[k]}}</span></span>`;
+    Object.entries(fmts).forEach(([k, fmt]) => {{
+      if (d.exif[k]) ehtml += `<span class="exif-chip">${{fmt(d.exif[k])}}</span>`;
     }});
     exifDiv.innerHTML = ehtml;
-  }} else {{
-    exifSection.style.display = 'none';
-  }}
+  }} else {{ exifSection.style.display = 'none'; }}
   // Scores
   const criteria = ['subject_clarity','lighting','color_pop','emotion','scroll_stop','crop_4x5'];
   const scoresDiv = document.getElementById('detail-scores');
   let html = '';
-  html += scoreBar('Final', d.final_score, 1, true);
-  html += scoreBar('Technical', d.technical_composite, 1, true);
-  html += scoreBar('Vision', d.vision_total, 60, false);
-  html += '<div style="height:4px"></div>';
+  html += scoreBar('Final', d.final_score, 1, true, true);
+  html += scoreBar('Technical', d.technical_composite, 1, true, false);
+  html += scoreBar('Vision', d.vision_total, 60, false, false);
   if (d.vision_detail) {{
+    html += '<div class="score-divider"></div>';
     criteria.forEach(c => {{
-      if (d.vision_detail[c] !== undefined) {{
-        html += scoreBar(c.replace(/_/g,' '), d.vision_detail[c], 10, false);
-      }}
+      if (d.vision_detail[c] !== undefined)
+        html += scoreBar(c.replace(/_/g,' '), d.vision_detail[c], 10, false, false);
     }});
   }}
   scoresDiv.innerHTML = html;
 }}
-function scoreBar(label, value, max, isFloat) {{
-  const pct = Math.min(100, (value / max) * 100);
+function scoreBar(label, value, max, isFloat, highlight) {{
+  const pct = Math.min(100, (value / max) * 100).toFixed(1);
   const display = isFloat ? value.toFixed(3) : Math.round(value);
+  const cls = highlight ? 'score-fill highlight' : 'score-fill';
   return `<div class="score-row">
     <span class="score-label">${{label}}</span>
-    <div class="score-bar-bg"><div class="score-bar" style="width:${{pct}}%"></div></div>
+    <div class="score-track">
+      <div class="${{cls}}" style="width:${{pct}}%">
+        <div class="score-dot"></div>
+      </div>
+    </div>
     <span class="score-val">${{display}}</span>
   </div>`;
 }}
@@ -4693,6 +4938,7 @@ def generate_gallery(
         tiles_html += (
             f'<div class="tile" data-idx="{i}" onclick="selectImage({i})">'
             f'<img src="{d["output_cropped"]}" loading="lazy" alt="">'
+            f'<div class="tile-overlay"></div>'
             f'<span class="tile-rank">#{d["rank"]}</span>'
             f'{uncertain_badge}'
             f'{burst_badge}'
@@ -4721,6 +4967,7 @@ def generate_gallery(
         tiles=tiles_html,
         json_data=json.dumps(data, indent=None),
         breadcrumb=breadcrumb,
+        shared_header_css=_SHARED_HEADER_CSS,
     )
     gallery_path = output_folder / "index.html"
     gallery_path.write_text(html, encoding="utf-8")
@@ -4747,18 +4994,10 @@ _INDEX_HTML_TEMPLATE = """\
     padding: 2rem;
   }}
   h1 {{
-    font-size: 1.4rem; font-weight: 600; margin-bottom: 1.5rem;
-    display: flex; align-items: center; gap: .5rem;
+    font-size: 1rem; font-weight: 600; margin-bottom: 1.5rem;
+    display: flex; align-items: center; flex-wrap: wrap; gap: .45rem;
   }}
-  h1 span {{ color: var(--accent); }}
-  .gh-link {{
-    color: var(--text-dim); transition: color .15s;
-  }}
-  .gh-link:hover {{ color: var(--text); }}
-  .breadcrumb {{ display: inline; font-size: .85rem; color: var(--text-dim); }}
-  .breadcrumb a {{ color: var(--text-dim); text-decoration: none; }}
-  .breadcrumb a:hover {{ color: var(--text); text-decoration: underline; }}
-  .breadcrumb .sep {{ margin: 0 .3rem; }}
+{shared_header_css}
   .folder-list {{
     list-style: none;
   }}
@@ -4786,11 +5025,6 @@ _INDEX_HTML_TEMPLATE = """\
     width: 48px; height: 48px; border-radius: 4px;
     object-fit: cover; background: var(--surface2); flex-shrink: 0;
   }}
-  .breadcrumb {{
-    font-size: .85rem; color: var(--text-dim); margin-bottom: 1rem;
-  }}
-  .breadcrumb a {{ color: var(--accent); text-decoration: none; }}
-  .breadcrumb a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
@@ -4798,7 +5032,7 @@ _INDEX_HTML_TEMPLATE = """\
   <a class="gh-link" href="https://github.com/renatobo/pickinsta" target="_blank" title="pickinsta on GitHub">
     <svg width="20" height="20" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
   </a>
-  <span>pickinsta</span> {breadcrumb} {title}
+  <span class="brand">pickinsta</span> {breadcrumb}<span class="page-title">{title}</span>
 </h1>
 <ul class="folder-list">
 {rows}
@@ -4910,6 +5144,7 @@ def generate_gallery_index(root: Path) -> list[Path]:
             title=idx_dir.name,
             breadcrumb=breadcrumb,
             rows=rows_html,
+            shared_header_css=_SHARED_HEADER_CSS,
         )
         idx_path = idx_dir / "index.html"
         idx_path.write_text(html, encoding="utf-8")
@@ -4952,7 +5187,8 @@ Examples:
         "--work", "-w", default=None, help="Work folder for intermediate files (default: <input>_work next to input)"
     )
     parser.add_argument(
-        "--top", "-n", type=int, default=10, help="Number of top images to output (default: 10)"
+        "--top", "-n", type=int, default=10, metavar="N",
+        help="Number of top images to output (default: 10, must be >= 1)"
     )
     parser.add_argument(
         "--scorer",
@@ -4965,7 +5201,8 @@ Examples:
         "--vision-pct",
         type=float,
         default=0.5,
-        help="Fraction of technically-scored images to send to vision scoring (default: 0.5)",
+        metavar="[0-1]",
+        help="Fraction of technically-scored images to send to vision scoring (default: 0.5, range: 0.0-1.0)",
     )
     parser.add_argument(
         "--claude-model",
@@ -5006,6 +5243,11 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    if args.top < 1:
+        parser.error(f"--top must be >= 1, got {args.top}")
+    if not (0.0 <= args.vision_pct <= 1.0):
+        parser.error(f"--vision-pct must be between 0.0 and 1.0, got {args.vision_pct}")
 
     if args.dedup_only:
         run_dedup_only(

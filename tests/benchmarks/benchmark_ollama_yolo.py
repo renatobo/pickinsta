@@ -253,7 +253,7 @@ def main() -> None:
     resized, source_map = selector.resize_for_processing(src, work)
     if not resized:
         raise SystemExit("No images found to benchmark.")
-    unique = selector.deduplicate(resized)
+    unique, _ = selector.deduplicate(resized)
     scored = selector.batch_technical_score(unique, source_map=source_map)
 
     if args.all:
