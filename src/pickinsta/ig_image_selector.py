@@ -328,8 +328,12 @@ def resolve_ollama_circuit_breaker_errors() -> int:
 
 
 def resolve_ollama_prompt_variant() -> str:
-    """Resolve Gemma 4 prompt variant: default, claude, system, claude+system, or freeform."""
-    return (os.environ.get(OLLAMA_PROMPT_VARIANT_ENV_VAR) or "").strip().lower() or "default"
+    """Resolve Gemma 4 prompt variant: default, claude, system, claude+system, or freeform.
+
+    Defaults to claude+system for Gemma 4 models as it produces the best
+    score differentiation (SDI 0.23 vs 0.00 for default).
+    """
+    return (os.environ.get(OLLAMA_PROMPT_VARIANT_ENV_VAR) or "").strip().lower() or "claude+system"
 
 
 def resolve_account_context(search_dir: Optional[Path] = None) -> str:

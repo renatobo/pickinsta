@@ -55,7 +55,7 @@ The core pipeline in `src/pickinsta/ig_image_selector.py` processes images throu
 - **CLIP** (`--scorer clip`): Free, local, zero-shot classification. Uses 4 positive + 2 negative prompts. Maps logits to 0-60 scale to match Claude's range.
 - **Claude** (`--scorer claude`): Default model `claude-haiku-4-5-20251001`. Images downsized to 1024px/q75 before API call to reduce token cost. Scores 6 criteria (subject_clarity, lighting, color_pop, emotion, scroll_stop, crop_4x5). Returns JSON with scores + one-line summary. Brand bonus: Ducati bikes get +2 on subject_clarity and emotion.
 - **Ollama** (`--scorer ollama`): Self-hosted vision scoring with the same 0-60 rubric. Supports retry/backoff, circuit breaker, and configurable request concurrency. Supported model families: `qwen2.5vl` and `gemma4`. Both use a compact JSON prompt + strict schema; other models get a generic JSON prompt.
-  - **Gemma 4 workaround**: Ollama bug [#15260](https://github.com/ollama/ollama/issues/15260) — `think=false` + `format` parameter causes structured output to be silently ignored. For `gemma4:*` models, the `think` key is **omitted entirely** from the payload. Also uses `temperature=0.3` (vs 0 for other models). Token budget 280 (vs 512 for Qwen, 220 default).
+  - **Gemma 4 workaround**: Ollama bug [#15260](https://github.com/ollama/ollama/issues/15260) — `think=false` + `format` parameter causes structured output to be silently ignored. For `gemma4:*` models, the `think` key is **omitted entirely** from the payload. Also uses `temperature=0.3` (vs 0 for other models). Token budget 280 (vs 512 for Qwen, 220 default). Defaults to `claude+system` prompt variant (Claude-rich prompt + system persona) to reduce score tier-collapse (SDI 0.23 vs 0.00 with default prompt). Handles namespaced models (e.g. `user/gemma4-...`).
 
 **Final Score Calculation**: `final_score = 0.3 * technical_composite + 0.7 * vision_normalized`
 
@@ -155,7 +155,7 @@ Key variables:
 - `PICKINSTA_OLLAMA_MAX_RETRIES` — retries for transient failures (default: `2`)
 - `PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC` — exponential backoff base seconds (default: `0.75`)
 - `PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS` — consecutive failure threshold before fallback (default: `6`)
-- `PICKINSTA_OLLAMA_PROMPT_VARIANT` — Gemma 4 prompt variant: `default`, `claude` (Claude-rich prompt), `system` (system message), `claude+system` (both). Only affects Gemma 4 models.
+- `PICKINSTA_OLLAMA_PROMPT_VARIANT` — Gemma 4 prompt variant: `default`, `claude` (Claude-rich prompt), `system` (system message), `claude+system` (both, **default**), `freeform` (no structured output). Only affects Gemma 4 models.
 - `PICKINSTA_YOLO_MODEL` — override YOLO model path (default: `~/.cache/pickinsta/models/yolov8n.pt`)
 
 ### CLI Flags
