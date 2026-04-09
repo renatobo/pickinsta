@@ -150,6 +150,9 @@ pickinsta ./input --output ./selected --scorer claude --rescore
 
 # Deduplicate only; no ranking or vision scoring
 pickinsta ./input --output ./deduped --dedup-only
+
+# Process each leaf subfolder under an input root and mirror the tree in output
+pickinsta ./input --output ./selected --scorer claude --all --recursive
 ```
 
 ### Help
@@ -173,6 +176,7 @@ Current flags implemented in [`src/pickinsta/ig_image_selector.py`](/home/renato
 - `--claude-crop-first`: pre-crop to 1080x1440 before Claude scoring
 - `--rescore`: ignore cached vision results
 - `--dedup-only`: emit unique-image outputs after dedup without ranking
+- `--recursive`: process each leaf subfolder under the input folder and build a recursive summary
 
 ## Pipeline Overview
 
@@ -207,7 +211,30 @@ Per-run artifacts:
 - `selection_report.md`: human-readable report including analyzed image scores
 - `index.html`: browsable local gallery
 
+Recursive runs also write:
+
+- `selection_report_recursive.json`: summary across all processed folders
+- `selection_report_recursive.md`: human-readable recursive summary
+
 Crop uncertainty is tracked in the reports. When the crop pipeline falls back or detects a risky crop, those reasons are preserved in report metadata and surfaced in the gallery.
+
+### Regenerate Galleries
+
+If you already have folders with `selection_report.json` files and want to rebuild all gallery pages recursively, run:
+
+```bash
+python scripts/generate_gallery.py /home/renatobo/Photos/td6_best
+```
+
+This creates `index.html` in each folder containing a report and adds parent directory indexes that link into the nested galleries.
+
+If you prefer to use the virtualenv explicitly:
+
+```bash
+.venv/bin/python scripts/generate_gallery.py /home/renatobo/Photos/td6_best
+```
+
+If `td6_best` only contains raw input folders, run `pickinsta` on those folders first so the `selection_report.json` files exist before regenerating galleries.
 
 ## Caching
 

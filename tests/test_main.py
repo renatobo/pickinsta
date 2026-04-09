@@ -58,6 +58,47 @@ def test_main_parses_cli_and_invokes_run_pipeline(monkeypatch, tmp_path) -> None
     }
 
 
+def test_main_recursive_flag_invokes_recursive_runner(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def fake_run_pipeline_recursive(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "out"
+
+    monkeypatch.setattr(selector, "run_pipeline_recursive", fake_run_pipeline_recursive)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pickinsta",
+            str(input_dir),
+            "--output",
+            str(output_dir),
+            "--recursive",
+            "--scorer",
+            "clip",
+        ],
+    )
+
+    selector.main()
+
+    assert captured == {
+        "input_folder": str(input_dir),
+        "output_folder": str(output_dir),
+        "work_folder": None,
+        "top_n": 10,
+        "scorer": "clip",
+        "vision_candidates_pct": 0.5,
+        "claude_model": selector.resolve_claude_model(),
+        "score_all": False,
+        "claude_crop_first": False,
+        "rescore": False,
+    }
+
+
 def test_main_unrecognized_argument_prints_full_help(monkeypatch, capsys) -> None:
     monkeypatch.setattr(sys, "argv", ["pickinsta", "./input", "--bogus"])
 

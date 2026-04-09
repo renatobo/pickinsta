@@ -209,6 +209,52 @@ def test_smart_crop_overrides_tight_edge_candidate_when_subject_is_wide(tmp_path
     assert white_cols.max() <= 280
 
 
+def test_expand_subject_bbox_biased_toward_motorcycle_front_side() -> None:
+    sx, sy, sw, sh = 200, 100, 300, 180
+
+    symmetric = selector._expand_subject_bbox(
+        sx,
+        sy,
+        sw,
+        sh,
+        img_w=1000,
+        img_h=600,
+        class_name="motorcycle",
+    )
+    facing_right = selector._expand_subject_bbox(
+        sx,
+        sy,
+        sw,
+        sh,
+        img_w=1000,
+        img_h=600,
+        class_name="motorcycle",
+        facing="right",
+    )
+    facing_left = selector._expand_subject_bbox(
+        sx,
+        sy,
+        sw,
+        sh,
+        img_w=1000,
+        img_h=600,
+        class_name="motorcycle",
+        facing="left",
+    )
+
+    sym_left_gap = sx - symmetric[0]
+    sym_right_gap = symmetric[0] + symmetric[2] - (sx + sw)
+    assert sym_left_gap == sym_right_gap
+
+    right_left_gap = facing_right[0] + facing_right[2] - (sx + sw)
+    right_right_gap = sx - facing_right[0]
+    assert right_left_gap > right_right_gap
+
+    left_left_gap = sx - facing_left[0]
+    left_right_gap = facing_left[0] + facing_left[2] - (sx + sw)
+    assert left_left_gap > left_right_gap
+
+
 def test_write_padded_full_subject_writes_expected_dimensions(tmp_path) -> None:
     src = tmp_path / "source.jpg"
     out = tmp_path / "padded.jpg"

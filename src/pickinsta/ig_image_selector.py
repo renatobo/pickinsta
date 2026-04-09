@@ -2856,8 +2856,13 @@ def _expand_subject_bbox(
     img_w: int,
     img_h: int,
     class_name: str = "",
+    facing: str = "",
 ) -> tuple[int, int, int, int]:
-    """Expand a detected subject bbox to avoid overly-tight crops."""
+    """Expand a detected subject bbox to avoid overly-tight crops.
+
+    For motorcycles and rider+bike detections, bias the expansion toward the
+    leading side so the front wheel/bumper is less likely to be clipped.
+    """
     if class_name == "rider_motorcycle":
         pad_ratio_x = max(YOLO_BBOX_PAD_RATIO, 0.10)
         pad_ratio_y = max(YOLO_BBOX_PAD_RATIO, 0.08)
@@ -2871,10 +2876,24 @@ def _expand_subject_bbox(
     pad_x = max(YOLO_BBOX_PAD_MIN_PX, int(round(sw * pad_ratio_x)))
     pad_y = max(YOLO_BBOX_PAD_MIN_PX, int(round(sh * pad_ratio_y)))
 
+    # Default to symmetric expansion.
     x0 = max(0, sx - pad_x)
     y0 = max(0, sy - pad_y)
     x1 = min(img_w, sx + sw + pad_x)
     y1 = min(img_h, sy + sh + pad_y)
+
+    # Motorcycle crops need a little more room on the front side than on the rear.
+    # This helps preserve the leading wheel when YOLO boxes are tight.
+    if class_name in {"motorcycle", "rider_motorcycle"} and facing in {"left", "right"}:
+        front_pad_x = max(YOLO_BBOX_PAD_MIN_PX, int(round(sw * 0.12)))
+        rear_pad_x = max(4, int(round(sw * 0.04)))
+        if facing == "right":
+            x0 = max(0, sx - rear_pad_x)
+            x1 = min(img_w, sx + sw + front_pad_x)
+        else:
+            x0 = max(0, sx - front_pad_x)
+            x1 = min(img_w, sx + sw + rear_pad_x)
+
     return x0, y0, max(1, x1 - x0), max(1, y1 - y0)
 
 
@@ -3100,8 +3119,6 @@ def smart_crop(
         if yolo_result:
             sx, sy, sw, sh, class_name, conf = yolo_result
             raw_bbox = (sx, sy, sw, sh)
-            sx, sy, sw, sh = _expand_subject_bbox(sx, sy, sw, sh, w, h, class_name=class_name)
-            expanded_bbox = (sx, sy, sw, sh)
             detection_method = f"yolo ({class_name})"
 
     # Fallback to saliency
@@ -3134,6 +3151,28 @@ def smart_crop(
 
     center_x = sx + sw // 2
     center_y = sy + sh // 2
+
+    if detection_method.startswith("yolo"):
+        facing = _guess_facing_direction(img, *raw_bbox) if raw_bbox is not None else "unknown"
+        sx, sy, sw, sh = _expand_subject_bbox(
+            sx,
+            sy,
+            sw,
+            sh,
+            w,
+            h,
+            class_name=class_name,
+            facing=facing,
+        )
+        expanded_bbox = (sx, sy, sw, sh)
+        center_x = sx + sw // 2
+        center_y = sy + sh // 2
+    else:
+        facing = _guess_facing_direction(img, sx, sy, sw, sh)
+        sx, sy, sw, sh = _expand_subject_bbox(sx, sy, sw, sh, w, h, facing=facing)
+        expanded_bbox = (sx, sy, sw, sh)
+        center_x = sx + sw // 2
+        center_y = sy + sh // 2
 
     if debug:
         print(
@@ -3842,6 +3881,60 @@ _DEDUP_GALLERY_TEMPLATE = """\
     color: var(--text-dim); margin-top: .5rem; }}
   .exif-row span {{ white-space: nowrap; }}
   .exif-val {{ color: var(--text); font-weight: 500; }}
+
+  @media (max-width: 900px) {{
+    body {{
+      padding: 0;
+    }}
+
+    header {{
+      padding: .75rem 1rem;
+    }}
+
+    header h1 {{
+      font-size: 1.1rem;
+      flex-wrap: wrap;
+      gap: .35rem;
+    }}
+
+    .info {{
+      padding: .5rem 1rem;
+    }}
+
+    .layout {{
+      flex-direction: column;
+      height: auto;
+    }}
+
+    .grid-panel {{
+      max-height: 48vh;
+      padding: .75rem 1rem 1rem;
+    }}
+
+    .grid {{
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    }}
+
+    .detail-panel {{
+      width: 100%;
+      min-width: 0;
+      border-left: 0;
+      border-top: 1px solid var(--border);
+      max-height: none;
+    }}
+
+    .version-tabs {{
+      flex-wrap: wrap;
+    }}
+
+    .version-tabs button {{
+      min-width: 0;
+    }}
+
+    .preview-img {{
+      max-height: 42vh;
+    }}
+  }}
 </style>
 </head>
 <body>
@@ -4609,6 +4702,77 @@ _GALLERY_HTML_TEMPLATE = """\
   ::-webkit-scrollbar {{ width: 4px; height: 4px; }}
   ::-webkit-scrollbar-track {{ background: transparent; }}
   ::-webkit-scrollbar-thumb {{ background: var(--border2); border-radius: 2px; }}
+  .exif-row span {{ white-space: nowrap; }}
+  .exif-val {{ color: var(--text); font-weight: 500; }}
+  ::-webkit-scrollbar {{ width: 6px; }}
+  ::-webkit-scrollbar-track {{ background: var(--bg); }}
+  ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
+
+  @media (max-width: 900px) {{
+    body {{
+      padding: 0;
+    }}
+
+    header {{
+      padding: .75rem 1rem;
+    }}
+
+    header h1 {{
+      font-size: 1.1rem;
+      flex-wrap: wrap;
+      gap: .35rem;
+    }}
+
+    .info {{
+      padding: .5rem 1rem;
+    }}
+
+    .layout {{
+      flex-direction: column;
+      height: auto;
+    }}
+
+    .grid-panel {{
+      max-height: 48vh;
+      padding: .75rem 1rem 1rem;
+    }}
+
+    .grid {{
+      grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    }}
+
+    .detail-panel {{
+      width: 100%;
+      min-width: 0;
+      border-left: 0;
+      border-top: 1px solid var(--border);
+      max-height: none;
+    }}
+
+    .preview-row {{
+      flex-direction: column;
+    }}
+
+    .preview-col {{
+      width: 100%;
+    }}
+
+    .version-tabs {{
+      flex-wrap: wrap;
+    }}
+
+    .version-tabs button {{
+      min-width: 0;
+    }}
+
+    .preview-img-wrap img {{
+      max-height: 42vh;
+    }}
+
+    .score-label {{
+      width: 74px;
+    }}
+  }}
 </style>
 </head>
 <body>
@@ -5153,6 +5317,215 @@ def generate_gallery_index(root: Path) -> list[Path]:
     return generated
 
 
+def _has_supported_images(folder: Path) -> bool:
+    """Return True when a folder contains at least one supported image."""
+    try:
+        return any(
+            p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+            for p in folder.iterdir()
+        )
+    except Exception:
+        return False
+
+
+def _discover_recursive_input_folders(root: Path) -> list[Path]:
+    """Find folders to process in recursive mode.
+
+    A folder is selected when it contains images and no descendant folder also
+    contains images. This keeps the recursive run focused on leaf image sets.
+    """
+    if not root.exists():
+        return []
+
+    candidate_dirs: set[Path] = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if any(Path(name).suffix.lower() in SUPPORTED_EXTENSIONS for name in filenames):
+            candidate_dirs.add(Path(dirpath))
+
+    if not candidate_dirs and _has_supported_images(root):
+        candidate_dirs.add(root)
+
+    ordered = sorted(candidate_dirs, key=lambda p: (len(p.parts), str(p)))
+    leaf_dirs: list[Path] = []
+    for folder in ordered:
+        if not any(other != folder and other.is_relative_to(folder) for other in ordered):
+            leaf_dirs.append(folder)
+
+    return leaf_dirs
+
+
+def _write_recursive_summary_report(
+    *,
+    root_input: Path,
+    output_root: Path,
+    scorer: str,
+    top_n: int,
+    folder_summaries: list[dict],
+) -> tuple[Path, Path]:
+    """Write a root-level recursive summary report for all processed folders."""
+    json_path = output_root / "selection_report_recursive.json"
+    md_path = output_root / "selection_report_recursive.md"
+
+    total_folders = len(folder_summaries)
+    total_selected = sum(int(item.get("selected_count", 0)) for item in folder_summaries)
+    total_uncertain = sum(int(item.get("uncertain_crops", 0)) for item in folder_summaries)
+    avg_top_score = (
+        sum(float(item.get("top_score", 0.0)) for item in folder_summaries) / total_folders
+        if total_folders
+        else 0.0
+    )
+
+    payload = {
+        "input_root": str(root_input),
+        "output_root": str(output_root),
+        "scorer": scorer,
+        "top_n": top_n,
+        "folders_processed": total_folders,
+        "total_selected": total_selected,
+        "total_uncertain_crops": total_uncertain,
+        "avg_top_score": round(avg_top_score, 4),
+        "folders": folder_summaries,
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    lines: list[str] = []
+    lines.append("# pickinsta Recursive Report")
+    lines.append("")
+    lines.append(f"- Input root: `{root_input}`")
+    lines.append(f"- Output root: `{output_root}`")
+    lines.append(f"- Scorer: `{scorer}`")
+    lines.append(f"- Top N per folder: `{top_n}`")
+    lines.append(f"- Folders processed: `{total_folders}`")
+    lines.append(f"- Total selected outputs: `{total_selected}`")
+    lines.append(f"- Total uncertain crops: `{total_uncertain}`")
+    lines.append(f"- Average top score: `{avg_top_score:.4f}`")
+    lines.append("")
+    lines.append("| Folder | Selected | Top score | Uncertain crops | Output |")
+    lines.append("|---|---:|---:|---:|---|")
+    for item in folder_summaries:
+        rel = item.get("relative_folder", ".")
+        out_rel = item.get("output_relative", rel)
+        lines.append(
+            "| "
+            f"{_md_escape(rel)} | "
+            f"{item.get('selected_count', 0)} | "
+            f"{float(item.get('top_score', 0.0)):.4f} | "
+            f"{item.get('uncertain_crops', 0)} | "
+            f"{_md_escape(out_rel)} |"
+        )
+    lines.append("")
+    lines.append("## Folder Reports")
+    lines.append("")
+    for item in folder_summaries:
+        rel = item.get("relative_folder", ".")
+        report_rel = item.get("report_relative")
+        output_rel = item.get("output_relative")
+        lines.append(f"- `{rel}` -> `{output_rel}`")
+        if report_rel:
+            lines.append(f"  - Report: `{report_rel}`")
+
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return json_path, md_path
+
+
+def run_pipeline_recursive(
+    input_folder: str,
+    output_folder: str = "selected",
+    work_folder: Optional[str] = None,
+    top_n: int = 10,
+    scorer: str = "clip",
+    vision_candidates_pct: float = 0.5,
+    claude_model: Optional[str] = None,
+    score_all: bool = False,
+    claude_crop_first: bool = False,
+    rescore: bool = False,
+):
+    """Run the pipeline for every leaf image folder under input_folder."""
+    src = Path(input_folder)
+    out = Path(output_folder)
+    work_root = Path(work_folder) if work_folder else out.parent / f"{out.name}_work"
+
+    if not src.exists():
+        print(f"❌ Input folder not found: {src}")
+        sys.exit(1)
+
+    targets = _discover_recursive_input_folders(src)
+    if not targets:
+        print(f"❌ No supported images found under {src}")
+        sys.exit(1)
+
+    out.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("🏍️  Recursive Instagram Image Selection Pipeline")
+    print(f"   Input root:  {src}")
+    print(f"   Output root: {out}")
+    print(f"   Work root:   {work_root}")
+    print(f"   Scorer:      {scorer}")
+    print(f"   Folders:     {len(targets)}")
+    print(f"   Top N:       {top_n}")
+    print("=" * 60)
+
+    summaries: list[dict] = []
+    for folder in targets:
+        rel = folder.relative_to(src)
+        output_dir = out / rel
+        work_dir = work_root / rel
+        print(f"\n📁 Recursive folder: {folder}")
+        report = run_pipeline(
+            input_folder=str(folder),
+            output_folder=str(output_dir),
+            work_folder=str(work_dir),
+            top_n=top_n,
+            scorer=scorer,
+            vision_candidates_pct=vision_candidates_pct,
+            claude_model=claude_model,
+            score_all=score_all,
+            claude_crop_first=claude_crop_first,
+            rescore=rescore,
+        )
+        report_json_path = output_dir / "selection_report.json"
+        summaries.append(
+            {
+                "relative_folder": "." if rel == Path(".") else str(rel),
+                "output_relative": "." if rel == Path(".") else str(rel),
+                "input_folder": str(folder),
+                "output_folder": str(output_dir),
+                "report_path": str(report_json_path),
+                "report_relative": str(report_json_path.relative_to(out)),
+                "selected_count": len(report),
+                "top_score": float(report[0]["final_score"]) if report else 0.0,
+                "avg_final_score": (
+                    sum(float(item["final_score"]) for item in report) / len(report)
+                    if report
+                    else 0.0
+                ),
+                "uncertain_crops": sum(1 for item in report if item.get("uncertain_crop")),
+                "report": report,
+            }
+        )
+
+    recursive_json, recursive_md = _write_recursive_summary_report(
+        root_input=src,
+        output_root=out,
+        scorer=scorer,
+        top_n=top_n,
+        folder_summaries=summaries,
+    )
+    generated = generate_gallery_index(out)
+
+    print(f"\n{'=' * 60}")
+    print(f"🏆 Recursive run complete: {len(summaries)} folders processed")
+    print(f"🗂️  Work root retained: {work_root}")
+    print(f"📋 Recursive JSON Report: {recursive_json}")
+    print(f"📝 Recursive Markdown Report: {recursive_md}")
+    if generated:
+        print(f"🌐 Generated gallery/index pages: {len(generated)}")
+    print(f"{'=' * 60}")
+
+    return summaries
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -5241,9 +5614,19 @@ Examples:
             "as full/hd/cropped. No scoring, no ranking, no debug files."
         ),
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help=(
+            "Process each leaf subfolder under the input folder, mirror the folder "
+            "structure in the output, and build a recursive summary report."
+        ),
+    )
 
     args = parser.parse_args()
 
+    if args.recursive and args.dedup_only:
+        parser.error("--recursive cannot be combined with --dedup-only")
     if args.top < 1:
         parser.error(f"--top must be >= 1, got {args.top}")
     if not (0.0 <= args.vision_pct <= 1.0):
@@ -5257,7 +5640,8 @@ Examples:
         )
         sys.exit(0)
 
-    run_pipeline(
+    runner = run_pipeline_recursive if args.recursive else run_pipeline
+    runner(
         input_folder=args.input,
         output_folder=args.output,
         work_folder=args.work,

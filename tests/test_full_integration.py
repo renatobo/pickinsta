@@ -160,6 +160,73 @@ def test_run_pipeline_missing_input_exits(tmp_path) -> None:
         selector.run_pipeline(input_folder=str(missing))
 
 
+def test_run_pipeline_recursive_processes_leaf_folders_and_writes_summary(tmp_path, monkeypatch) -> None:
+    input_dir = tmp_path / "input"
+    output_dir = tmp_path / "selected"
+    input_dir.mkdir()
+
+    leaf_a = input_dir / "session_a"
+    leaf_b = input_dir / "session_b" / "nested"
+    leaf_a.mkdir(parents=True)
+    leaf_b.mkdir(parents=True)
+    (leaf_a / "a.jpg").write_text("a", encoding="utf-8")
+    (leaf_b / "b.jpg").write_text("b", encoding="utf-8")
+
+    calls = []
+
+    def fake_run_pipeline(**kwargs):
+        calls.append(kwargs)
+        out = Path(kwargs["output_folder"])
+        out.mkdir(parents=True, exist_ok=True)
+        report = [
+            {
+                "rank": 1,
+                "filename": Path(kwargs["input_folder"]).name + ".jpg",
+                "final_score": 0.91,
+                "technical_composite": 0.55,
+                "vision_total": 54,
+                "one_line": "recursive test",
+                "output_cropped": "01_cropped_test.jpg",
+                "output_hd": "01_hd_test.jpg",
+                "output_full": "01_full_test.jpg",
+                "uncertain_crop": False,
+                "uncertain_crop_reasons": [],
+                "burst": None,
+            }
+        ]
+        (out / "selection_report.json").write_text(json.dumps(report), encoding="utf-8")
+        (out / "selection_report.md").write_text("# report\n", encoding="utf-8")
+        return report
+
+    gallery_calls = []
+
+    def fake_generate_gallery_index(root):
+        gallery_calls.append(root)
+        return []
+
+    monkeypatch.setattr(selector, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(selector, "generate_gallery_index", fake_generate_gallery_index)
+
+    summaries = selector.run_pipeline_recursive(
+        input_folder=str(input_dir),
+        output_folder=str(output_dir),
+        scorer="clip",
+    )
+
+    assert [Path(call["input_folder"]).relative_to(input_dir).as_posix() for call in calls] == [
+        "session_a",
+        "session_b/nested",
+    ]
+    assert (output_dir / "selection_report_recursive.json").exists()
+    assert (output_dir / "selection_report_recursive.md").exists()
+    assert gallery_calls == [output_dir]
+    assert len(summaries) == 2
+    assert summaries[0]["relative_folder"] == "session_a"
+    assert summaries[1]["relative_folder"] == "session_b/nested"
+    assert (output_dir / "session_a" / "selection_report.json").exists()
+    assert (output_dir / "session_b" / "nested" / "selection_report.json").exists()
+
+
 def test_run_pipeline_claude_prefers_crop_safe_outputs(tmp_path, monkeypatch) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "selected"
