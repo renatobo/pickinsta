@@ -32,6 +32,7 @@ class BenchmarkVariant:
     scorer: str  # ollama | claude
     model: str
     yolo_enabled: bool
+    prompt_variant: str = "default"
 
 
 @dataclass
@@ -100,6 +101,30 @@ def _md_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").strip()
 
 
+_VISION_KEYS = ("subject_clarity", "lighting", "color_pop", "emotion", "scroll_stop", "crop_4x5")
+
+
+def _compute_sdi(ranked_rows: list[dict]) -> float:
+    """Score Differentiation Index: mean stdev of 6 criteria across images."""
+    stdevs: list[float] = []
+    for row in ranked_rows:
+        scores = [row.get(k) for k in _VISION_KEYS]
+        nums = [float(s) for s in scores if s != "" and s is not None]
+        if len(nums) >= 2:
+            stdevs.append(statistics.stdev(nums))
+    return statistics.fmean(stdevs) if stdevs else 0.0
+
+
+def _count_unique_tuples(ranked_rows: list[dict]) -> int:
+    """Count distinct (s1,s2,s3,s4,s5,s6) score combos across images."""
+    tuples = set()
+    for row in ranked_rows:
+        scores = tuple(row.get(k, "") for k in _VISION_KEYS)
+        if any(s != "" and s is not None for s in scores):
+            tuples.add(scores)
+    return len(tuples)
+
+
 def _ranked_rows(ranked: list[ImageScore]) -> list[dict]:
     rows: list[dict] = []
     for idx, item in enumerate(ranked, start=1):
@@ -151,6 +176,8 @@ def _benchmark_variant(
     if variant.scorer == "ollama":
         env[selector.PICKINSTA_OLLAMA_MODEL_ENV_VAR] = variant.model
         env[selector.OLLAMA_USE_YOLO_ENV_VAR] = "true" if variant.yolo_enabled else "false"
+        if variant.prompt_variant != "default":
+            env[selector.OLLAMA_PROMPT_VARIANT_ENV_VAR] = variant.prompt_variant
     elif variant.scorer == "claude":
         env["ANTHROPIC_MODEL"] = variant.model
 
@@ -214,12 +241,17 @@ def _write_report(
     for metric in all_metrics:
         grouped.setdefault(metric.variant_label, []).append(metric)
 
-    summary_rows: list[tuple[str, str, str, str, float, float, float, float]] = []
+    first_runs = _first_run_by_variant(all_metrics)
+
+    summary_rows: list[tuple[str, str, str, str, float, float, float, float, float, int]] = []
     for variant in variants:
         metrics = grouped.get(variant.label, [])
         if not metrics:
             continue
         avg_sec = _avg([m.sec_per_image for m in metrics])
+        first_run = first_runs.get(variant.label)
+        sdi = _compute_sdi(first_run.ranked_rows) if first_run else 0.0
+        unique = _count_unique_tuples(first_run.ranked_rows) if first_run else 0
         summary_rows.append(
             (
                 variant.label,
@@ -230,6 +262,8 @@ def _write_report(
                 _avg([m.images_per_min for m in metrics]),
                 _avg([m.duration_sec for m in metrics]),
                 _avg([float(m.failed_count) for m in metrics]),
+                sdi,
+                unique,
             )
         )
     summary_rows.sort(key=lambda row: row[4])
@@ -250,13 +284,13 @@ def _write_report(
     lines.append("")
     lines.append("## Speed Summary")
     lines.append("")
-    lines.append("| Variant | Scorer | Model | YOLO | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | Speed vs fastest |")
-    lines.append("|---|---|---|---|---:|---:|---:|---:|---:|")
-    for label, scorer_name, model, yolo, sec_img, img_min, duration, failures in summary_rows:
+    lines.append("| Variant | Scorer | Model | YOLO | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | SDI | Unique tuples | Speed vs fastest |")
+    lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    for label, scorer_name, model, yolo, sec_img, img_min, duration, failures, sdi, unique in summary_rows:
         speed_factor = (sec_img / fastest_sec_per_img) if fastest_sec_per_img > 0 else 0.0
         lines.append(
             f"| {_md_escape(label)} | {scorer_name} | {_md_escape(model)} | {yolo} | "
-            f"{sec_img:.2f} | {img_min:.2f} | {duration:.2f} | {failures:.2f} | {speed_factor:.2f}x |"
+            f"{sec_img:.2f} | {img_min:.2f} | {duration:.2f} | {failures:.2f} | {sdi:.2f} | {unique} | {speed_factor:.2f}x |"
         )
 
     lines.append("")
@@ -271,7 +305,6 @@ def _write_report(
                 f"{m.sec_per_image:.2f} | {m.images_per_min:.2f} | {m.failed_count} |"
             )
 
-    first_runs = _first_run_by_variant(all_metrics)
     if first_runs:
         lines.append("")
         lines.append("## Image-by-Image Score Comparison (Run 1)")
@@ -381,6 +414,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable per-variant warmup (default warmup scores 1 image, then waits 10s).",
     )
     parser.add_argument(
+        "--prompt-variant",
+        choices=["default", "claude", "system", "claude+system", "freeform"],
+        default="default",
+        help="Gemma 4 prompt variant (default: default).",
+    )
+    parser.add_argument(
         "--report",
         default="docs/ollama-model-benchmark-report.md",
         help="Output Markdown report path (default: docs/ollama-model-benchmark-report.md).",
@@ -390,6 +429,7 @@ def parse_args() -> argparse.Namespace:
 
 def _build_variants(args: argparse.Namespace, models: list[str]) -> list[BenchmarkVariant]:
     variants: list[BenchmarkVariant] = []
+    prompt_variant = args.prompt_variant
     yolo_modes = [False]
     if args.variants == "on":
         yolo_modes = [True]
@@ -399,12 +439,16 @@ def _build_variants(args: argparse.Namespace, models: list[str]) -> list[Benchma
     for yolo_enabled in yolo_modes:
         yolo_label = "on" if yolo_enabled else "off"
         for model in models:
+            label = f"{model} | yolo={yolo_label}"
+            if prompt_variant != "default":
+                label += f" | prompt={prompt_variant}"
             variants.append(
                 BenchmarkVariant(
-                    label=f"{model} | yolo={yolo_label}",
+                    label=label,
                     scorer="ollama",
                     model=model,
                     yolo_enabled=yolo_enabled,
+                    prompt_variant=prompt_variant,
                 )
             )
 

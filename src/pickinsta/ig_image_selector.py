@@ -83,6 +83,8 @@ OLLAMA_QWEN_SMALL_EDGE_THRESHOLD = 512
 OLLAMA_QWEN_MODEL_PREFIXES = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl")
 OLLAMA_GEMMA4_MODEL_PREFIXES = ("gemma4",)
 OLLAMA_GEMMA4_NUM_PREDICT = 280  # Gemma 4 JSON output is slightly more verbose than default
+OLLAMA_GEMMA4_CLAUDE_NUM_PREDICT = 350  # Claude-rich prompt may elicit longer one_line
+OLLAMA_PROMPT_VARIANT_ENV_VAR = "PICKINSTA_OLLAMA_PROMPT_VARIANT"
 YOLO_MODEL_FILENAME = "yolov8n.pt"
 YOLO_MODEL_URL = "https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt"
 YOLO_MODEL_ENV_VAR = "PICKINSTA_YOLO_MODEL"
@@ -323,6 +325,11 @@ def resolve_ollama_retry_backoff_seconds() -> float:
 def resolve_ollama_circuit_breaker_errors() -> int:
     """Resolve consecutive-error threshold before halting new submissions."""
     return min(50, max(1, _resolve_env_int(OLLAMA_CIRCUIT_BREAKER_ENV_VAR, 6)))
+
+
+def resolve_ollama_prompt_variant() -> str:
+    """Resolve Gemma 4 prompt variant: default, claude, system, claude+system, or freeform."""
+    return (os.environ.get(OLLAMA_PROMPT_VARIANT_ENV_VAR) or "").strip().lower() or "default"
 
 
 def resolve_account_context(search_dir: Optional[Path] = None) -> str:
@@ -1419,6 +1426,13 @@ BRAND BONUS: Ducati identifiable → add 2 to subject_clarity and emotion (max 1
 Return ONLY valid JSON with keys: subject_clarity, lighting, color_pop, emotion, scroll_stop, crop_4x5, total, one_line.
 """
 
+OLLAMA_SYSTEM_PROMPT = (
+    "You are a professional motorsport photographer and Instagram content curator. "
+    "You evaluate motorcycle photos for visual quality, composition, and social media impact. "
+    "You always score each criterion independently based on what you observe — "
+    "different aspects of a photo can have very different quality levels."
+)
+
 OLLAMA_STRICT_JSON_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1505,9 +1519,12 @@ def _is_gemma4_ollama_model(model: str) -> bool:
     Gemma 4 requires the `think` key to be omitted entirely when using the `format`
     parameter — setting think=false breaks structured output (Ollama bug #15260).
     Also uses a slightly higher temperature per Google's recommendations.
+    Handles both bare tags (gemma4:e4b) and namespaced models (user/gemma4-...).
     """
     normalized = (model or "").strip().lower()
-    return any(normalized.startswith(prefix) for prefix in OLLAMA_GEMMA4_MODEL_PREFIXES)
+    # Check bare name (gemma4:...) and namespaced (user/gemma4-...)
+    bare = normalized.rsplit("/", 1)[-1] if "/" in normalized else normalized
+    return any(bare.startswith(prefix) for prefix in OLLAMA_GEMMA4_MODEL_PREFIXES)
 
 
 def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
@@ -1517,6 +1534,9 @@ def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
             return OLLAMA_QWEN_NUM_PREDICT_SMALL_EDGE
         return OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
     if _is_gemma4_ollama_model(model):
+        variant = resolve_ollama_prompt_variant()
+        if variant in ("claude", "claude+system", "freeform"):
+            return OLLAMA_GEMMA4_CLAUDE_NUM_PREDICT
         return OLLAMA_GEMMA4_NUM_PREDICT
     return OLLAMA_DEFAULT_NUM_PREDICT
 
@@ -1932,6 +1952,7 @@ def score_with_ollama(
         base_prompt = base_prompt + yolo_context
 
     _is_gemma4 = _is_gemma4_ollama_model(model)
+    _prompt_variant = resolve_ollama_prompt_variant() if _is_gemma4 else "default"
 
     def _send_ollama_request(*, active_prompt: str, response_format: object, num_predict: int) -> tuple[str, dict]:
         # Gemma 4: omit `think` entirely — setting think=false breaks `format` (Ollama bug #15260)
@@ -1939,11 +1960,18 @@ def score_with_ollama(
         payload: dict = {
             "model": model,
             "stream": False,
-            "format": response_format,
             "keep_alive": keep_alive,
             "options": {"temperature": 0.3 if _is_gemma4 else 0, "num_predict": num_predict},
-            "messages": [{"role": "user", "content": active_prompt, "images": [image_data]}],
         }
+        # Freeform variant: omit `format` to let the model generate JSON naturally
+        # instead of forcing structured output (which causes tier-collapse on Gemma 4)
+        if _prompt_variant != "freeform":
+            payload["format"] = response_format
+        messages: list[dict] = []
+        if _is_gemma4 and _prompt_variant in ("system", "claude+system"):
+            messages.append({"role": "system", "content": OLLAMA_SYSTEM_PROMPT})
+        messages.append({"role": "user", "content": active_prompt, "images": [image_data]})
+        payload["messages"] = messages
         if not _is_gemma4:
             payload["think"] = False
         request = Request(
@@ -1968,11 +1996,12 @@ def score_with_ollama(
             raise RuntimeError(f"Ollama connection failed for {endpoint}: {error}") from error
         return body, json.loads(body)
 
-    _is_gemma4 = _is_gemma4_ollama_model(model)
     use_structured_profile = _is_qwen_ollama_model(model) or _is_gemma4
     if use_structured_profile:
         account_context = _extract_account_context_from_prompt(base_prompt)
-        if _is_gemma4:
+        if _is_gemma4 and _prompt_variant in ("claude", "claude+system"):
+            primary_prompt = build_vision_prompt(account_context)
+        elif _is_gemma4:
             primary_prompt = build_ollama_gemma4_prompt(account_context)
         else:
             primary_prompt = build_ollama_compact_json_prompt(account_context)
@@ -1994,7 +2023,9 @@ def score_with_ollama(
     # Retry once when first pass degraded into plain/neutral fallback output.
     if parse_mode.startswith("plain-") or parse_mode.startswith("neutral-"):
         retry_context = _extract_account_context_from_prompt(base_prompt)
-        if _is_gemma4:
+        if _is_gemma4 and _prompt_variant in ("claude", "claude+system"):
+            retry_prompt = build_vision_prompt(retry_context)
+        elif _is_gemma4:
             retry_prompt = build_ollama_gemma4_prompt(retry_context)
         else:
             retry_prompt = build_ollama_compact_json_prompt(retry_context)
