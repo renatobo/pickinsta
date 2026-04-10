@@ -16,5 +16,9 @@ selected/*
 input_work/*
 !input_work/.gitkeep
 *.pickinsta.json
+*.techscore.json
 .claude/settings.local.json
 yolov8n.pt
+.serena/
+*_work/
+*_work_bench/
