@@ -82,9 +82,8 @@ OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE = 750
 OLLAMA_QWEN_SMALL_EDGE_THRESHOLD = 512
 OLLAMA_QWEN_MODEL_PREFIXES = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl")
 OLLAMA_GEMMA4_MODEL_PREFIXES = ("gemma4",)
-OLLAMA_GEMMA4_NUM_PREDICT = 280  # Gemma 4 JSON output is slightly more verbose than default
-OLLAMA_GEMMA4_CLAUDE_NUM_PREDICT = 350  # Claude-rich prompt may elicit longer one_line
-OLLAMA_PROMPT_VARIANT_ENV_VAR = "PICKINSTA_OLLAMA_PROMPT_VARIANT"
+OLLAMA_GEMMA4_NUM_PREDICT = 350  # Gemma 4 always uses claude+system (Claude-rich prompt)
+OLLAMA_PROMPT_VARIANT_ENV_VAR = "PICKINSTA_OLLAMA_PROMPT_VARIANT"  # retained for store key compat
 YOLO_MODEL_FILENAME = "yolov8n.pt"
 YOLO_MODEL_URL = "https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt"
 YOLO_MODEL_ENV_VAR = "PICKINSTA_YOLO_MODEL"
@@ -328,12 +327,8 @@ def resolve_ollama_circuit_breaker_errors() -> int:
 
 
 def resolve_ollama_prompt_variant() -> str:
-    """Resolve Gemma 4 prompt variant: default or claude+system.
-
-    Defaults to claude+system for Gemma 4 models as it produces the best
-    score differentiation (SDI 0.19 vs 0.17 for default).
-    """
-    return (os.environ.get(OLLAMA_PROMPT_VARIANT_ENV_VAR) or "").strip().lower() or "claude+system"
+    """Gemma 4 always uses claude+system (Claude-rich prompt + system persona)."""
+    return "claude+system"
 
 
 def resolve_account_context(search_dir: Optional[Path] = None) -> str:
@@ -1401,34 +1396,6 @@ Rules:
 - BRAND BONUS: This is a Ducati-focused account. If the motorcycle is identifiably a Ducati, add 2 bonus points to subject_clarity and emotion (max 10 each). All other brands or unidentifiable bikes score normally — do NOT penalize them.
 """
 
-OLLAMA_GEMMA4_JSON_PROMPT_TEMPLATE = """Evaluate this motorcycle photo for Instagram cover potential.
-
-Context: {account_context}.
-
-Score each criterion INDEPENDENTLY as an integer 0-10. Each criterion measures something different — it is normal and expected for scores to vary across criteria.
-
-Criteria:
-- subject_clarity: sharpness, framing, visual dominance of the subject
-- lighting: exposure balance, no blown highlights, no crushed shadows
-- color_pop: vividness, contrast, visual impact of colors
-- emotion: sense of speed, drama, excitement, or atmosphere
-- scroll_stop: would a viewer stop scrolling past this in a feed?
-- crop_4x5: how well the subject fills a 4:5 portrait crop
-
-Score anchors: 1-3=poor, 4-5=mediocre, 6-7=good, 8-9=excellent, 10=exceptional.
-
-Example of correctly differentiated scoring (do NOT copy these numbers — score what you actually see):
-subject_clarity=8, lighting=4, color_pop=7, emotion=9, scroll_stop=6, crop_4x5=5
-(High emotion and sharp subject, but poor lighting and awkward crop. Different criteria = different scores.)
-
-total = exact integer sum of all 6 scores.
-
-one_line: A single sentence starting with what the subject is doing or looks like in this specific image. No preamble. Example: "A red Ducati leans hard through a sun-lit hairpin with blurred background."
-
-BRAND BONUS: Ducati identifiable → add 2 to subject_clarity and emotion (max 10 each). Other brands: score normally.
-
-Return ONLY valid JSON with keys: subject_clarity, lighting, color_pop, emotion, scroll_stop, crop_4x5, total, one_line.
-"""
 
 OLLAMA_SYSTEM_PROMPT = (
     "You are a professional motorsport photographer and Instagram content curator. "
@@ -1484,15 +1451,6 @@ def build_ollama_compact_json_prompt(account_context: str) -> str:
     return OLLAMA_COMPACT_JSON_PROMPT_TEMPLATE.format(account_context=context)
 
 
-def build_ollama_gemma4_prompt(account_context: str) -> str:
-    """Build per-criterion rubric prompt for Gemma 4 models.
-
-    Uses distinct criterion definitions and score anchors to prevent the
-    quantized-score collapse seen with the compact prompt on small models.
-    """
-    context = account_context.strip() or DEFAULT_ACCOUNT_CONTEXT
-    return OLLAMA_GEMMA4_JSON_PROMPT_TEMPLATE.format(account_context=context)
-
 
 def _extract_account_context_from_prompt(prompt_text: str) -> str:
     """Best-effort extraction of account context from a full vision prompt."""
@@ -1538,9 +1496,6 @@ def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
             return OLLAMA_QWEN_NUM_PREDICT_SMALL_EDGE
         return OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
     if _is_gemma4_ollama_model(model):
-        variant = resolve_ollama_prompt_variant()
-        if variant == "claude+system":
-            return OLLAMA_GEMMA4_CLAUDE_NUM_PREDICT
         return OLLAMA_GEMMA4_NUM_PREDICT
     return OLLAMA_DEFAULT_NUM_PREDICT
 
@@ -1956,7 +1911,6 @@ def score_with_ollama(
         base_prompt = base_prompt + yolo_context
 
     _is_gemma4 = _is_gemma4_ollama_model(model)
-    _prompt_variant = resolve_ollama_prompt_variant() if _is_gemma4 else "default"
 
     def _send_ollama_request(*, active_prompt: str, response_format: object, num_predict: int) -> tuple[str, dict]:
         # Gemma 4: omit `think` entirely — setting think=false breaks `format` (Ollama bug #15260)
@@ -1973,7 +1927,7 @@ def score_with_ollama(
         if not _is_gemma4:
             payload["format"] = response_format
         messages: list[dict] = []
-        if _is_gemma4 and _prompt_variant == "claude+system":
+        if _is_gemma4:
             messages.append({"role": "system", "content": OLLAMA_SYSTEM_PROMPT})
         messages.append({"role": "user", "content": active_prompt, "images": [image_data]})
         payload["messages"] = messages
@@ -2004,10 +1958,8 @@ def score_with_ollama(
     use_structured_profile = _is_qwen_ollama_model(model) or _is_gemma4
     if use_structured_profile:
         account_context = _extract_account_context_from_prompt(base_prompt)
-        if _is_gemma4 and _prompt_variant == "claude+system":
+        if _is_gemma4:
             primary_prompt = build_vision_prompt(account_context)
-        elif _is_gemma4:
-            primary_prompt = build_ollama_gemma4_prompt(account_context)
         else:
             primary_prompt = build_ollama_compact_json_prompt(account_context)
         if yolo_context:
@@ -2028,10 +1980,8 @@ def score_with_ollama(
     # Retry once when first pass degraded into plain/neutral fallback output.
     if parse_mode.startswith("plain-") or parse_mode.startswith("neutral-"):
         retry_context = _extract_account_context_from_prompt(base_prompt)
-        if _is_gemma4 and _prompt_variant == "claude+system":
+        if _is_gemma4:
             retry_prompt = build_vision_prompt(retry_context)
-        elif _is_gemma4:
-            retry_prompt = build_ollama_gemma4_prompt(retry_context)
         else:
             retry_prompt = build_ollama_compact_json_prompt(retry_context)
         if yolo_context:
