@@ -21,14 +21,11 @@
 
 ### gemma4:e4b — Issues found
 
-**1. Quantized / degenerate scoring** *(confirmed not fixable with prompting)*
+**1. Quantized / degenerate scoring** *(resolved in v1.1.0 — root cause was the Ollama format schema, not model capacity)*
 
-Most images received identical scores across all 6 criteria (e.g., all 9s → total 54, or all 5s → total 30). Three separate prompt variants were tested (2026-04-09):
-- Original compact prompt (same as Qwen)
-- Gemma 4-specific prompt with per-criterion definitions and score anchors
-- Same prompt extended with a concrete counter-example showing differentiated scores
+Most images received identical scores across all 6 criteria (e.g., all 9s → total 54, or all 5s → total 30). Three separate prompt variants were tested (2026-04-09) and all collapsed. At the time, this was diagnosed as a model capacity issue. **That diagnosis was wrong.**
 
-All three produced the same tier-collapse behaviour. This is a model capacity issue, not a prompt issue — `gemma4:e4b` (≈4B parameters) does not have sufficient capacity to independently evaluate 6 visual dimensions. **Prompt engineering cannot fix this.** A larger model is required.
+Root cause (identified 2026-04-10): the Ollama `format` schema parameter silently forces Gemma 4 to collapse all criteria to a single tier regardless of prompt content. Fix: remove the `format` parameter for all Gemma 4 models. After the fix, SDI rose from 0.00 to 0.17–0.19 on the same 4B model with no prompt changes. See `docs/gemma4-sdi-report.md` for full results.
 
 **2. Thinking chain bleedthrough in `one_line`** *(mitigated in code)*
 
@@ -40,9 +37,12 @@ The `one_line` field contained `"Here's a thinking process to arrive at the desi
 
 ### Recommendations
 
-- **Do not use `gemma4:e4b` as primary scorer.** Tier-collapse makes vision scores nearly useless for ranking; final scores are dominated by the technical score.
-- **Try `gemma4:12b` or `gemma4:27b`** — larger parameter counts are required to independently evaluate multi-dimensional rubrics.
-- **`qwen2.5vl:7b` remains the recommended Ollama model.** Once installed, re-run this benchmark for a direct comparison.
+> **Updated 2026-04-10:** The tier-collapse finding was caused by the Ollama format schema bug, not model capacity. `gemma4:e4b` is usable after the v1.1.0 fix. See `docs/gemma4-sdi-report.md` for updated benchmarks.
+
+- ~~**Do not use `gemma4:e4b` as primary scorer.**~~ **`gemma4:e4b` with `claude+system` is viable** (SDI 0.19, 19 unique score tuples) after the format-schema fix.
+- ~~**Try `gemma4:12b` or `gemma4:27b`**~~ — the 4B model is sufficient once the schema parameter is removed. Larger variants are worth trying if available but not required.
+- **Do not use `gemma4:e4b-it-q8_0`** — 48% slower with half the SDI on this hardware. No benefit over the base model.
+- **`qwen2.5vl:7b` remains the recommended Ollama model.** Re-run this benchmark with it installed for a direct comparison.
 - The `one_line` preamble-strip fix benefits all models that leak thinking text, not just Gemma 4.
 
 ---
