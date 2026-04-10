@@ -328,10 +328,10 @@ def resolve_ollama_circuit_breaker_errors() -> int:
 
 
 def resolve_ollama_prompt_variant() -> str:
-    """Resolve Gemma 4 prompt variant: default, claude, system, or claude+system.
+    """Resolve Gemma 4 prompt variant: default or claude+system.
 
     Defaults to claude+system for Gemma 4 models as it produces the best
-    score differentiation (SDI 0.23 vs 0.00 for default).
+    score differentiation (SDI 0.19 vs 0.17 for default).
     """
     return (os.environ.get(OLLAMA_PROMPT_VARIANT_ENV_VAR) or "").strip().lower() or "claude+system"
 
@@ -1539,7 +1539,7 @@ def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
         return OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
     if _is_gemma4_ollama_model(model):
         variant = resolve_ollama_prompt_variant()
-        if variant in ("claude", "claude+system"):
+        if variant == "claude+system":
             return OLLAMA_GEMMA4_CLAUDE_NUM_PREDICT
         return OLLAMA_GEMMA4_NUM_PREDICT
     return OLLAMA_DEFAULT_NUM_PREDICT
@@ -1973,7 +1973,7 @@ def score_with_ollama(
         if not _is_gemma4:
             payload["format"] = response_format
         messages: list[dict] = []
-        if _is_gemma4 and _prompt_variant in ("system", "claude+system"):
+        if _is_gemma4 and _prompt_variant == "claude+system":
             messages.append({"role": "system", "content": OLLAMA_SYSTEM_PROMPT})
         messages.append({"role": "user", "content": active_prompt, "images": [image_data]})
         payload["messages"] = messages
@@ -2004,7 +2004,7 @@ def score_with_ollama(
     use_structured_profile = _is_qwen_ollama_model(model) or _is_gemma4
     if use_structured_profile:
         account_context = _extract_account_context_from_prompt(base_prompt)
-        if _is_gemma4 and _prompt_variant in ("claude", "claude+system"):
+        if _is_gemma4 and _prompt_variant == "claude+system":
             primary_prompt = build_vision_prompt(account_context)
         elif _is_gemma4:
             primary_prompt = build_ollama_gemma4_prompt(account_context)
@@ -2028,7 +2028,7 @@ def score_with_ollama(
     # Retry once when first pass degraded into plain/neutral fallback output.
     if parse_mode.startswith("plain-") or parse_mode.startswith("neutral-"):
         retry_context = _extract_account_context_from_prompt(base_prompt)
-        if _is_gemma4 and _prompt_variant in ("claude", "claude+system"):
+        if _is_gemma4 and _prompt_variant == "claude+system":
             retry_prompt = build_vision_prompt(retry_context)
         elif _is_gemma4:
             retry_prompt = build_ollama_gemma4_prompt(retry_context)

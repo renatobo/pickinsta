@@ -461,7 +461,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prompt-variants",
         nargs="+",
-        choices=["default", "claude", "system", "claude+system"],
+        choices=["default", "claude+system"],
         default=["default"],
         metavar="VARIANT",
         help="One or more Gemma 4 prompt variants to benchmark (default: default).",
