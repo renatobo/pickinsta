@@ -83,7 +83,6 @@ OLLAMA_QWEN_SMALL_EDGE_THRESHOLD = 512
 OLLAMA_QWEN_MODEL_PREFIXES = ("qwen3-vl", "qwen2.5vl", "qwen2.5-vl")
 OLLAMA_GEMMA4_MODEL_PREFIXES = ("gemma4",)
 OLLAMA_GEMMA4_NUM_PREDICT = 350  # Gemma 4 always uses claude+system (Claude-rich prompt)
-OLLAMA_PROMPT_VARIANT_ENV_VAR = "PICKINSTA_OLLAMA_PROMPT_VARIANT"  # retained for store key compat
 YOLO_MODEL_FILENAME = "yolov8n.pt"
 YOLO_MODEL_URL = "https://github.com/ultralytics/assets/releases/latest/download/yolov8n.pt"
 YOLO_MODEL_ENV_VAR = "PICKINSTA_YOLO_MODEL"
@@ -324,11 +323,6 @@ def resolve_ollama_retry_backoff_seconds() -> float:
 def resolve_ollama_circuit_breaker_errors() -> int:
     """Resolve consecutive-error threshold before halting new submissions."""
     return min(50, max(1, _resolve_env_int(OLLAMA_CIRCUIT_BREAKER_ENV_VAR, 6)))
-
-
-def resolve_ollama_prompt_variant() -> str:
-    """Gemma 4 always uses claude+system (Claude-rich prompt + system persona)."""
-    return "claude+system"
 
 
 def resolve_account_context(search_dir: Optional[Path] = None) -> str:
@@ -1449,7 +1443,6 @@ def build_ollama_compact_json_prompt(account_context: str) -> str:
     """Build compact strict-json prompt for Ollama models."""
     context = account_context.strip() or DEFAULT_ACCOUNT_CONTEXT
     return OLLAMA_COMPACT_JSON_PROMPT_TEMPLATE.format(account_context=context)
-
 
 
 def _extract_account_context_from_prompt(prompt_text: str) -> str:
