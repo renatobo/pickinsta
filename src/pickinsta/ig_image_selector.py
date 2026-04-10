@@ -1967,9 +1967,10 @@ def score_with_ollama(
             "keep_alive": keep_alive,
             "options": {"temperature": 0.3 if _is_gemma4 else 0, "num_predict": num_predict},
         }
-        # Freeform variant: omit `format` to let the model generate JSON naturally
-        # instead of forcing structured output (which causes tier-collapse on Gemma 4)
-        if _prompt_variant != "freeform":
+        # Gemma 4: never use the `format` parameter — it causes tier-collapse (all criteria score
+        # the same value) regardless of prompt variant. All prompts already instruct JSON output
+        # so parsing still works without schema enforcement.
+        if not _is_gemma4:
             payload["format"] = response_format
         messages: list[dict] = []
         if _is_gemma4 and _prompt_variant in ("system", "claude+system"):
