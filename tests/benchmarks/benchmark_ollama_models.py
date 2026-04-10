@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import statistics
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
@@ -83,6 +85,49 @@ def _clone_candidates(candidates: list[ImageScore]) -> list[ImageScore]:
         )
         for item in candidates
     ]
+
+
+def _image_set_hash(candidates: list[ImageScore]) -> str:
+    entries = sorted(
+        (str(p := item.source_path or item.path), p.stat().st_size)
+        for item in candidates
+    )
+    return hashlib.sha256(json.dumps(entries).encode()).hexdigest()[:16]
+
+
+@dataclass
+class BenchmarkStore:
+    """Persistent JSON store of RunMetrics keyed on variant config + image set."""
+
+    path: Path
+
+    def _variant_key(self, variant: BenchmarkVariant) -> str:
+        return f"{variant.scorer}|{variant.model}|{variant.yolo_enabled}|{variant.prompt_variant}"
+
+    def _load_raw(self) -> dict:
+        if self.path.exists():
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                return {}
+        return {}
+
+    def get_cached_metrics(self, variant: BenchmarkVariant, image_set_hash: str) -> list[RunMetrics] | None:
+        entry = self._load_raw().get(self._variant_key(variant))
+        if entry and entry.get("image_set_hash") == image_set_hash:
+            return [RunMetrics(**r) for r in entry["runs"]]
+        return None
+
+    def store_metrics(self, variant: BenchmarkVariant, metrics: list[RunMetrics], image_set_hash: str) -> None:
+        data = self._load_raw()
+        data[self._variant_key(variant)] = {
+            "variant": asdict(variant),
+            "runs": [asdict(m) for m in metrics],
+            "image_set_hash": image_set_hash,
+            "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _failed_item(item: ImageScore) -> bool:
@@ -424,6 +469,20 @@ def parse_args() -> argparse.Namespace:
         default="docs/ollama-model-benchmark-report.md",
         help="Output Markdown report path (default: docs/ollama-model-benchmark-report.md).",
     )
+    parser.add_argument(
+        "--results-file",
+        default=None,
+        help=(
+            "Path to a JSON file for persisting benchmark results across runs. "
+            "Cached variants are skipped and loaded from this file instead of recomputed. "
+            "New results are merged back in."
+        ),
+    )
+    parser.add_argument(
+        "--rescore",
+        action="store_true",
+        help="Ignore cached results in --results-file and recompute all variants.",
+    )
     return parser.parse_args()
 
 
@@ -498,11 +557,22 @@ def main() -> None:
     if not candidates:
         raise SystemExit("No candidates selected for benchmark.")
 
+    store = BenchmarkStore(Path(args.results_file).expanduser().resolve()) if args.results_file else None
+    image_set_hash = _image_set_hash(candidates)
+
     print(
         f"🧪 Benchmarking {len(variants)} variant(s) on {len(candidates)} candidates, {args.runs} run(s) each"
     )
+    if store:
+        print(f"📦 Results store: {store.path}")
     all_metrics: list[RunMetrics] = []
     for idx, variant in enumerate(variants, start=1):
+        if store and not args.rescore:
+            cached = store.get_cached_metrics(variant, image_set_hash)
+            if cached:
+                print(f"⚡ Variant {idx}/{len(variants)}: {variant.label} — loaded from cache")
+                all_metrics.extend(cached)
+                continue
         print(f"➡️  Variant {idx}/{len(variants)}: {variant.label}")
         metrics = _benchmark_variant(
             variant=variant,
@@ -512,6 +582,8 @@ def main() -> None:
             warmup=warmup,
         )
         all_metrics.extend(metrics)
+        if store:
+            store.store_metrics(variant, metrics, image_set_hash)
 
     _write_report(
         report_path=report_path,

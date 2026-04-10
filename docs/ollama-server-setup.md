@@ -209,8 +209,51 @@ This produces a Markdown report comparing:
 - average images per minute
 - average total duration
 - failures per run
+- SDI (Score Differentiation Index) — mean per-image stdev across the 6 vision criteria; higher means the model discriminates more between criteria
+- unique score tuples — distinct `(s1…s6)` combinations across images; low values indicate tier-collapse
 
 If your local tags differ, replace the `--models` values with the exact names from `ollama list`.
+
+### Persistent result store
+
+Benchmarking a new model normally re-runs all existing variants, even though their scores haven't changed. Use `--results-file` to persist results and skip unchanged variants on future runs:
+
+```bash
+# First run: establish baselines and save to store
+.venv/bin/python tests/benchmarks/benchmark_ollama_models.py \
+  --input ./input \
+  --all \
+  --models qwen2.5vl:7b \
+  --include-claude \
+  --results-file docs/benchmark_store.json \
+  --report docs/baseline.md
+
+# Later: add a new model — only the new model runs, baselines load from store
+.venv/bin/python tests/benchmarks/benchmark_ollama_models.py \
+  --input ./input \
+  --all \
+  --models qwen2.5vl:7b gemma4:27b \
+  --include-claude \
+  --results-file docs/benchmark_store.json \
+  --report docs/comparison.md
+# ⚡ qwen2.5vl:7b | yolo=off — loaded from cache
+# ⚡ claude-sonnet-4-6 | scorer=claude — loaded from cache
+# ➡️  gemma4:27b | yolo=off — running…
+```
+
+The store is keyed on `scorer|model|yolo|prompt_variant`. Results are automatically invalidated when the input image set changes (detected by a content hash). To force a full recompute, add `--rescore`:
+
+```bash
+.venv/bin/python tests/benchmarks/benchmark_ollama_models.py \
+  --input ./input \
+  --all \
+  --models qwen2.5vl:7b gemma4:27b \
+  --results-file docs/benchmark_store.json \
+  --rescore \
+  --report docs/comparison.md
+```
+
+`benchmark_store.json` accumulates results across sessions — commit it alongside your report files if you want baselines to persist across machines or branches.
 
 ## 8. Benchmark With and Without YOLO Context
 
