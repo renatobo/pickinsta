@@ -328,7 +328,7 @@ def resolve_ollama_circuit_breaker_errors() -> int:
 
 
 def resolve_ollama_prompt_variant() -> str:
-    """Resolve Gemma 4 prompt variant: default, claude, system, claude+system, or freeform.
+    """Resolve Gemma 4 prompt variant: default, claude, system, or claude+system.
 
     Defaults to claude+system for Gemma 4 models as it produces the best
     score differentiation (SDI 0.23 vs 0.00 for default).
@@ -1539,7 +1539,7 @@ def _resolve_ollama_num_predict(model: str, max_image_edge: int) -> int:
         return OLLAMA_QWEN_NUM_PREDICT_LARGE_EDGE
     if _is_gemma4_ollama_model(model):
         variant = resolve_ollama_prompt_variant()
-        if variant in ("claude", "claude+system", "freeform"):
+        if variant in ("claude", "claude+system"):
             return OLLAMA_GEMMA4_CLAUDE_NUM_PREDICT
         return OLLAMA_GEMMA4_NUM_PREDICT
     return OLLAMA_DEFAULT_NUM_PREDICT

@@ -155,7 +155,7 @@ Key variables:
 - `PICKINSTA_OLLAMA_MAX_RETRIES` — retries for transient failures (default: `2`)
 - `PICKINSTA_OLLAMA_RETRY_BACKOFF_SEC` — exponential backoff base seconds (default: `0.75`)
 - `PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS` — consecutive failure threshold before fallback (default: `6`)
-- `PICKINSTA_OLLAMA_PROMPT_VARIANT` — Gemma 4 prompt variant: `default`, `claude` (Claude-rich prompt), `system` (system message), `claude+system` (both, **default**), `freeform` (no structured output). Only affects Gemma 4 models.
+- `PICKINSTA_OLLAMA_PROMPT_VARIANT` — Gemma 4 prompt variant: `default`, `claude` (Claude-rich prompt), `system` (system message), `claude+system` (both, **default**). Only affects Gemma 4 models.
 - `PICKINSTA_YOLO_MODEL` — override YOLO model path (default: `~/.cache/pickinsta/models/yolov8n.pt`)
 
 ### CLI Flags

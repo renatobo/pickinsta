@@ -459,10 +459,12 @@ def parse_args() -> argparse.Namespace:
         help="Disable per-variant warmup (default warmup scores 1 image, then waits 10s).",
     )
     parser.add_argument(
-        "--prompt-variant",
-        choices=["default", "claude", "system", "claude+system", "freeform"],
-        default="default",
-        help="Gemma 4 prompt variant (default: default).",
+        "--prompt-variants",
+        nargs="+",
+        choices=["default", "claude", "system", "claude+system"],
+        default=["default"],
+        metavar="VARIANT",
+        help="One or more Gemma 4 prompt variants to benchmark (default: default).",
     )
     parser.add_argument(
         "--report",
@@ -488,7 +490,7 @@ def parse_args() -> argparse.Namespace:
 
 def _build_variants(args: argparse.Namespace, models: list[str]) -> list[BenchmarkVariant]:
     variants: list[BenchmarkVariant] = []
-    prompt_variant = args.prompt_variant
+    prompt_variants = args.prompt_variants
     yolo_modes = [False]
     if args.variants == "on":
         yolo_modes = [True]
@@ -498,18 +500,19 @@ def _build_variants(args: argparse.Namespace, models: list[str]) -> list[Benchma
     for yolo_enabled in yolo_modes:
         yolo_label = "on" if yolo_enabled else "off"
         for model in models:
-            label = f"{model} | yolo={yolo_label}"
-            if prompt_variant != "default":
-                label += f" | prompt={prompt_variant}"
-            variants.append(
-                BenchmarkVariant(
-                    label=label,
-                    scorer="ollama",
-                    model=model,
-                    yolo_enabled=yolo_enabled,
-                    prompt_variant=prompt_variant,
+            for prompt_variant in prompt_variants:
+                label = f"{model} | yolo={yolo_label}"
+                if prompt_variant != "default":
+                    label += f" | prompt={prompt_variant}"
+                variants.append(
+                    BenchmarkVariant(
+                        label=label,
+                        scorer="ollama",
+                        model=model,
+                        yolo_enabled=yolo_enabled,
+                        prompt_variant=prompt_variant,
+                    )
                 )
-            )
 
     if args.include_claude:
         variants.append(
