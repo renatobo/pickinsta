@@ -7,7 +7,7 @@ import pickinsta.ig_image_selector as selector
 
 
 def test_version() -> None:
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.1.0"
 
 
 def test_main_parses_cli_and_invokes_run_pipeline(monkeypatch, tmp_path) -> None:
