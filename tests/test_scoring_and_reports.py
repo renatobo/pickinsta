@@ -1,10 +1,24 @@
 import json
-from pathlib import Path
 import sys
 import types
+from pathlib import Path
+
+import numpy as np
 
 import pickinsta.ig_image_selector as selector
 from pickinsta.ig_image_selector import ImageScore
+
+
+def test_horizon_tilt_accepts_opencv5_flat_hough_lines(monkeypatch) -> None:
+    gray = np.zeros((100, 200), dtype=np.uint8)
+    monkeypatch.setattr(selector.cv2, "Canny", lambda *_args, **_kwargs: gray)
+    monkeypatch.setattr(
+        selector.cv2,
+        "HoughLinesP",
+        lambda *_args, **_kwargs: np.array([[0, 10, 180, 10]], dtype=np.int32),
+    )
+
+    assert selector._horizon_tilt_penalty(gray) == 1.0
 
 
 def test_write_markdown_report_contains_expected_sections_and_escapes(tmp_path) -> None:
@@ -71,7 +85,11 @@ def test_batch_technical_score_sorts_results_and_skips_failures(tmp_path, monkey
             raise ValueError("cannot score")
         return {"composite": scores[path.name]}
 
-    source_map = {good_a: Path("source_a.jpg"), good_b: Path("source_b.jpg"), bad: Path("source_bad.jpg")}
+    source_map = {
+        good_a: Path("source_a.jpg"),
+        good_b: Path("source_b.jpg"),
+        bad: Path("source_bad.jpg"),
+    }
     monkeypatch.setattr(selector, "score_technical", fake_score_technical)
 
     ranked = selector.batch_technical_score([good_a, bad, good_b], source_map=source_map)
@@ -148,8 +166,12 @@ def test_batch_vision_score_claude_uses_resolved_anthropic_key(tmp_path, monkeyp
     fake_anthropic_module = types.SimpleNamespace(Anthropic=FakeAnthropicClient)
     monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic_module)
 
-    monkeypatch.setattr(selector, "resolve_anthropic_api_key", lambda search_dir=None: "sk-test-key")
-    monkeypatch.setattr(selector, "resolve_claude_model", lambda cli_model=None: "claude-sonnet-4-5")
+    monkeypatch.setattr(
+        selector, "resolve_anthropic_api_key", lambda search_dir=None: "sk-test-key"
+    )
+    monkeypatch.setattr(
+        selector, "resolve_claude_model", lambda cli_model=None: "claude-sonnet-4-5"
+    )
     monkeypatch.setattr(selector, "_claude_model_candidates", lambda preferred: [preferred])
     monkeypatch.setattr(selector, "_file_sha256", lambda _path: "sha")
     monkeypatch.setattr(selector, "load_claude_score_from_file_cache", lambda **_kwargs: None)
@@ -190,8 +212,12 @@ def test_batch_vision_score_claude_applies_strong_crop_gate(tmp_path, monkeypatc
     fake_anthropic_module = types.SimpleNamespace(Anthropic=FakeAnthropicClient)
     monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic_module)
 
-    monkeypatch.setattr(selector, "resolve_anthropic_api_key", lambda search_dir=None: "sk-test-key")
-    monkeypatch.setattr(selector, "resolve_claude_model", lambda cli_model=None: "claude-sonnet-4-5")
+    monkeypatch.setattr(
+        selector, "resolve_anthropic_api_key", lambda search_dir=None: "sk-test-key"
+    )
+    monkeypatch.setattr(
+        selector, "resolve_claude_model", lambda cli_model=None: "claude-sonnet-4-5"
+    )
     monkeypatch.setattr(selector, "_claude_model_candidates", lambda preferred: [preferred])
     monkeypatch.setattr(selector, "_file_sha256", lambda _path: "sha")
     monkeypatch.setattr(selector, "load_claude_score_from_file_cache", lambda **_kwargs: None)
@@ -231,10 +257,14 @@ def test_batch_vision_score_ollama_uses_resolved_server_and_model(tmp_path, monk
             return b'{"models":[]}'
 
     monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
-    monkeypatch.setattr(selector, "resolve_ollama_base_url", lambda search_dir=None: "http://remote:11434")
+    monkeypatch.setattr(
+        selector, "resolve_ollama_base_url", lambda search_dir=None: "http://remote:11434"
+    )
     monkeypatch.setattr(selector, "resolve_ollama_model", lambda search_dir=None: "qwen2.5vl:7b")
     monkeypatch.setattr(selector, "resolve_ollama_keep_alive", lambda search_dir=None: "10m")
-    monkeypatch.setattr(selector, "resolve_account_context", lambda search_dir=None: "motorcycle account")
+    monkeypatch.setattr(
+        selector, "resolve_account_context", lambda search_dir=None: "motorcycle account"
+    )
 
     def fake_score_with_ollama(
         path: Path,
@@ -287,10 +317,14 @@ def test_batch_vision_score_ollama_retries_and_succeeds(tmp_path, monkeypatch) -
     attempts = {"n": 0}
 
     monkeypatch.setattr(selector, "urlopen", lambda *_args, **_kwargs: FakeResponse())
-    monkeypatch.setattr(selector, "resolve_ollama_base_url", lambda search_dir=None: "http://remote:11434")
+    monkeypatch.setattr(
+        selector, "resolve_ollama_base_url", lambda search_dir=None: "http://remote:11434"
+    )
     monkeypatch.setattr(selector, "resolve_ollama_model", lambda search_dir=None: "qwen2.5vl:7b")
     monkeypatch.setattr(selector, "resolve_ollama_keep_alive", lambda search_dir=None: "10m")
-    monkeypatch.setattr(selector, "resolve_account_context", lambda search_dir=None: "motorcycle account")
+    monkeypatch.setattr(
+        selector, "resolve_account_context", lambda search_dir=None: "motorcycle account"
+    )
     monkeypatch.setattr(selector, "resolve_ollama_concurrency", lambda: 1)
     monkeypatch.setattr(selector, "resolve_ollama_max_retries", lambda: 2)
     monkeypatch.setattr(selector, "resolve_ollama_retry_backoff_seconds", lambda: 0.01)
@@ -313,7 +347,9 @@ def test_batch_vision_score_ollama_retries_and_succeeds(tmp_path, monkeypatch) -
     assert ranked[0].one_line == "Recovered after retry"
 
 
-def test_score_with_ollama_parses_json_from_thinking_when_content_is_empty(tmp_path, monkeypatch) -> None:
+def test_score_with_ollama_parses_json_from_thinking_when_content_is_empty(
+    tmp_path, monkeypatch
+) -> None:
     image_file = tmp_path / "thinking.jpg"
     image_file.write_bytes(b"fake-image")
     monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
@@ -390,7 +426,9 @@ def test_score_with_ollama_sets_think_false_in_payload(tmp_path, monkeypatch) ->
     assert "Return ONLY a JSON object" in (observed["prompt"] or "")
 
 
-def test_score_with_ollama_retries_compact_schema_after_neutral_fallback(tmp_path, monkeypatch) -> None:
+def test_score_with_ollama_retries_compact_schema_after_neutral_fallback(
+    tmp_path, monkeypatch
+) -> None:
     image_file = tmp_path / "retry-compact.jpg"
     image_file.write_bytes(b"fake-image")
     monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")
@@ -548,7 +586,9 @@ def test_score_with_ollama_repairs_total_and_sanitizes_one_line(tmp_path, monkey
     assert "Golden hour Ducati rider" in result["one_line"]
 
 
-def test_score_with_ollama_uses_neutral_fallback_for_prose_only_thinking(tmp_path, monkeypatch) -> None:
+def test_score_with_ollama_uses_neutral_fallback_for_prose_only_thinking(
+    tmp_path, monkeypatch
+) -> None:
     image_file = tmp_path / "thinking-prose.jpg"
     image_file.write_bytes(b"fake-image")
     monkeypatch.setattr(selector, "_encode_image_for_ollama", lambda *_args, **_kwargs: "b64")

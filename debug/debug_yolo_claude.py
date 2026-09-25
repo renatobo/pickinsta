@@ -2,14 +2,19 @@
 """Test YOLO-enhanced Claude scoring on a specific image."""
 
 from pathlib import Path
+
 import cv2
-import json
-from pickinsta.ig_image_selector import yolo_detect_subject, VISION_PROMPT
+
+from pickinsta.config import DEFAULT_ACCOUNT_CONTEXT
+from pickinsta.detection.yolo import yolo_detect_subject
+from pickinsta.vision.prompts import build_vision_prompt
+
+VISION_PROMPT = build_vision_prompt(DEFAULT_ACCOUNT_CONTEXT)
 
 # Test image
 test_image = Path("input/AB Group - Session 4 (Turn 6) - CVR_6108_Mar1025_1111AM_CaliPhoto.jpg")
 
-print(f"Testing YOLO detection and Claude prompt enhancement on:")
+print("Testing YOLO detection and Claude prompt enhancement on:")
 print(f"  {test_image}\n")
 
 # Run YOLO detection
@@ -25,8 +30,8 @@ if detection:
     img_h, img_w = img.shape[:2]
 
     # Calculate relative position
-    center_x = (x + w/2) / img_w
-    center_y = (y + h/2) / img_h
+    center_x = (x + w / 2) / img_w
+    center_y = (y + h / 2) / img_h
     size_ratio = (w * h) / (img_w * img_h)
 
     # Describe position
@@ -37,13 +42,15 @@ if detection:
     # Describe size
     size_desc = "large" if size_ratio > 0.3 else "medium" if size_ratio > 0.1 else "small"
 
-    yolo_context = f"\n\n**Detected Subject**: {class_name} ({position}, {size_desc}, confidence: {conf:.0%})"
+    yolo_context = (
+        f"\n\n**Detected Subject**: {class_name} ({position}, {size_desc}, confidence: {conf:.0%})"
+    )
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("ENHANCED CLAUDE PROMPT:")
-    print("="*70)
+    print("=" * 70)
     print(VISION_PROMPT + yolo_context)
-    print("="*70)
+    print("=" * 70)
 
     print("\n✅ YOLO detection provides Claude with:")
     print(f"   - Subject type: {class_name}")
@@ -57,8 +64,8 @@ if detection:
 else:
     print("\n⚠️  No subject detected by YOLO")
     print("Claude will receive the standard prompt without subject context")
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("STANDARD CLAUDE PROMPT:")
-    print("="*70)
+    print("=" * 70)
     print(VISION_PROMPT)
-    print("="*70)
+    print("=" * 70)

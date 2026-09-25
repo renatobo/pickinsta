@@ -4,6 +4,17 @@ This directory holds the operator and reference docs for `pickinsta`.
 
 ## Core References
 
+- [`architecture-reliability-performance-action-plan.md`](/home/renatobo/devel/pickinsta/docs/architecture-reliability-performance-action-plan.md)
+  Prioritized implementation plan for architecture, reliability, performance, and operational
+  improvements.
+
+- [`architecture-module-map.md`](architecture-module-map.md)
+  Evidence-backed current module graph, dependency rules, compatibility risks, and the exact next
+  extraction order with acceptance checks.
+
+- [`performance-decisions.md`](performance-decisions.md)
+  Measured optimizations, reproducible benchmark commands, and explicitly deferred candidates.
+
 - [`composition-rules.md`](/home/renatobo/devel/pickinsta/docs/composition-rules.md)
   Technical scoring weights, composition heuristics, and crop logic reference.
 
@@ -32,4 +43,3 @@ This directory holds the operator and reference docs for `pickinsta`.
 2. Use [`composition-rules.md`](/home/renatobo/devel/pickinsta/docs/composition-rules.md) when changing scoring or crop behavior.
 3. Use [`ollama-server-setup.md`](/home/renatobo/devel/pickinsta/docs/ollama-server-setup.md) when deploying self-hosted vision scoring.
 4. Use [`troubleshooting.md`](/home/renatobo/devel/pickinsta/docs/troubleshooting.md) when installs, model downloads, or scorer calls fail.
-

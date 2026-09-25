@@ -29,7 +29,7 @@ def _clip_setup_hint(error: Exception) -> str:
         )
     return (
         "CLIP initialization failed. Ensure compatible versions of torch/transformers are installed.\n"
-        "Run: python -c \"import transformers, torch; print(transformers.__version__, torch.__version__)\".\n"
+        'Run: python -c "import transformers, torch; print(transformers.__version__, torch.__version__)".\n'
         "Only if that fails, use Python 3.10-3.12."
     )
 
@@ -40,8 +40,6 @@ def score_with_clip(image_path: Path, model=None, processor=None) -> dict:
 
     if model is None or processor is None:
         model, processor = load_clip_model()
-
-    image = Image.open(image_path).convert("RGB")
 
     # Positive prompts (what we want)
     good_prompts = [
@@ -58,7 +56,10 @@ def score_with_clip(image_path: Path, model=None, processor=None) -> dict:
 
     all_prompts = good_prompts + bad_prompts
 
-    inputs = processor(text=all_prompts, images=image, return_tensors="pt", padding=True)
+    # Close both the source image and the converted copy promptly. Large batches can
+    # otherwise retain file descriptors until garbage collection runs.
+    with Image.open(image_path) as source_image, source_image.convert("RGB") as image:
+        inputs = processor(text=all_prompts, images=image, return_tensors="pt", padding=True)
     with torch.no_grad():
         outputs = model(**inputs)
     logits = outputs.logits_per_image.softmax(dim=1).numpy()[0]

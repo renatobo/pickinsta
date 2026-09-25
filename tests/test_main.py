@@ -1,13 +1,13 @@
-from pickinsta import __version__
 import sys
 
 import pytest
 
 import pickinsta.ig_image_selector as selector
+from pickinsta import __version__
 
 
 def test_version() -> None:
-    assert __version__ == "1.0.0"
+    assert __version__ == "1.3.0"
 
 
 def test_main_parses_cli_and_invokes_run_pipeline(monkeypatch, tmp_path) -> None:

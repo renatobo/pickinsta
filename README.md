@@ -1,5 +1,5 @@
 # pickinsta
-[![Python 3.10-3.12](https://img.shields.io/badge/python-3.10--3.12-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11-3.14](https://img.shields.io/badge/python-3.11--3.14-blue.svg)](https://www.python.org/downloads/)
 [![CI](https://github.com/renatobo/pickinsta/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/renatobo/pickinsta/actions/workflows/ci.yml)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
@@ -20,6 +20,8 @@
   - `NN_hd_<name>.jpg`
   - `NN_full_<name>.<ext>`
 - Writes `selection_report.json`, `selection_report.md`, and `index.html`.
+- Publishes immutable output generations and advances `current_run.json` as the final
+  completion marker.
 
 ## Quick Start
 
@@ -35,6 +37,8 @@ pickinsta ./input --output ./selected --top 10 --scorer clip
 For the default full local setup, `make install-dev` installs dev tooling and all scorer extras.
 
 ## Installation
+
+`pickinsta` supports Python 3.11 through 3.14.
 
 ### Recommended
 
@@ -69,7 +73,7 @@ python -m pip install -e ".[yolo]"
 python -m pip install -e ".[clip,claude,yolo]"
 ```
 
-Optional dependency groups from [`pyproject.toml`](/home/renatobo/devel/pickinsta/pyproject.toml):
+Optional dependency groups from [`pyproject.toml`](pyproject.toml):
 
 - `dev`: `pytest`, `ruff`, `pre-commit`
 - `clip`: `transformers`, `torch`
@@ -77,6 +81,13 @@ Optional dependency groups from [`pyproject.toml`](/home/renatobo/devel/pickinst
 - `yolo`: `ultralytics`
 
 If `ultralytics` is missing, smart crop falls back to non-YOLO heuristics.
+
+### Dependency reproducibility
+
+`pyproject.toml` declares minimum compatible dependency versions; the project does not currently
+commit a lockfile, so CI resolves the current compatible releases. Use an isolated virtual
+environment, and record the installed versions (for example, with `python -m pip freeze`) when a
+benchmark run must be reproducible.
 
 ## Configuration
 
@@ -116,6 +127,13 @@ PICKINSTA_OLLAMA_CIRCUIT_BREAKER_ERRORS=6
 
 # Optional custom YOLO weights
 PICKINSTA_YOLO_MODEL=/absolute/path/to/model.pt
+
+# Optional local image-processing limits (1-256)
+PICKINSTA_MAX_WORKERS=8
+PICKINSTA_PROCESS_WORKERS=4
+PICKINSTA_THREAD_WORKERS=8
+# 0 preserves OpenCV's default; 1 avoids nested native-thread oversubscription
+PICKINSTA_OPENCV_THREADS=1
 ```
 
 Environment resolution behavior:
@@ -124,6 +142,9 @@ Environment resolution behavior:
 - `HF_TOKEN` follows the same search order.
 - Ollama settings follow the same search order and default to `http://127.0.0.1:11434` with model `qwen2.5vl:7b`.
 - `CLAUDE_MODEL` is accepted as a fallback alias for `ANTHROPIC_MODEL`.
+- Local worker limits are read at pipeline startup. Stage-specific process and
+  thread limits override `PICKINSTA_MAX_WORKERS`; they do not change Claude or
+  Ollama request concurrency.
 
 ## Usage
 
@@ -163,7 +184,7 @@ pickinsta -h
 
 ## CLI Surface
 
-Current flags implemented in [`src/pickinsta/ig_image_selector.py`](/home/renatobo/devel/pickinsta/src/pickinsta/ig_image_selector.py):
+Current flags implemented in [`src/pickinsta/cli.py`](src/pickinsta/cli.py):
 
 - `input`: source folder of event photos
 - `--output`, `-o`: output folder, default `selected`
@@ -210,6 +231,35 @@ Per-run artifacts:
 - `selection_report.json`: machine-readable summary of selected outputs
 - `selection_report.md`: human-readable report including analyzed image scores
 - `index.html`: browsable local gallery
+- `run_manifest.json`: compatibility copy of the machine-readable run status, counts,
+  issues, configuration, stage timings, cache reuse, runtime metadata, and managed
+  artifact list
+- `current_run.json`: atomically updated pointer to the authoritative immutable run
+  generation under `.pickinsta-runs/`
+
+Output files are built in a temporary staging directory inside the selected output
+folder. `pickinsta` copies a complete immutable generation under `.pickinsta-runs/`,
+updates the flat compatibility files, and atomically advances `current_run.json` last.
+If the process stops during publication, the pointer still identifies the preceding
+complete generation. Read the referenced generation when a consistent snapshot is
+required. Unrelated files already in the output folder, such as operator notes, are
+never cleaned or replaced.
+
+A manifest status of `complete` means no output issue was recorded. `degraded` means
+publication completed, but one or more selected variants could not be produced or
+copied. Inspect `issues`, `processed`, `skipped`, and `failed` in the manifest, or the
+run summary in `selection_report.md`, before treating a degraded run as fully usable.
+
+The manifest's `stage_timings_seconds` values are cumulative wall-clock time for each
+named stage, while `stage_invocations` shows how many measured blocks contributed to
+that total. `caches.technical` and `caches.vision` report hits, misses, and the hit
+ratio for cache lookups that occurred; an absent cache name means that cache was not
+consulted. `runtime` records Python, platform, logical CPU count, peak process memory,
+and relevant package versions. Configuration keys ending in terms such as `token`,
+`password`, `secret`, `authorization`, `cookie`, or `api_key` are written as
+`[REDACTED]`, including nested keys. See the
+[`run_manifest.json` reference](docs/reference.md#run-manifest-contract) for the full
+field contract and a safe example.
 
 Recursive runs also write:
 
@@ -238,10 +288,15 @@ If `td6_best` only contains raw input folders, run `pickinsta` on those folders 
 
 ## Caching
 
-- Claude vision responses are cached beside the original input image as `<filename>.pickinsta.json`.
+- Claude vision responses use cache schema v2 and are stored beside the original input
+  image as `<filename>.pickinsta.json`. A hit requires the same source content, scorer,
+  model, prompt, and scoring/preprocessing options; older schemas are ignored.
 - Technical scoring is cached in the work folder as `<filename>.<ext>.techscore.json`.
+  A hit requires the current schema, work-image modification time, and technical
+  algorithm/dependency fingerprint.
 - `--rescore` bypasses cached vision results.
-- Changing prompt context or model selection can invalidate or bypass prior cache reuse, depending on scorer path and settings.
+- Changing Claude model, prompt context, crop-first input, preprocessing options, or
+  source content invalidates the corresponding vision entry automatically.
 
 ## Scorer Notes
 
@@ -261,11 +316,24 @@ If `td6_best` only contains raw input folders, run `pickinsta` on those folders 
 
 - Requires a reachable Ollama server and a pulled vision model.
 - Defaults are tuned for remote inference rather than maximum local parallelism.
-- See [`docs/ollama-server-setup.md`](/home/renatobo/devel/pickinsta/docs/ollama-server-setup.md) for setup and tuning guidance.
+- See [`docs/ollama-server-setup.md`](docs/ollama-server-setup.md) for setup and tuning guidance.
 
 ## Benchmarks
 
 Manual benchmark scripts live in `tests/benchmarks/`.
+
+For a deterministic, model-free baseline of resize, technical scoring, and technical
+cache reuse:
+
+```bash
+.venv/bin/python tests/benchmarks/offline_stage_benchmark.py \
+  --repetitions 5 --images 4 --output /tmp/pickinsta-benchmark.json
+```
+
+Compare median and p95 values only on similar, otherwise-idle hardware. Keep `cold`,
+`warm`, and `cached` results separate: cold creates resize outputs and scores, warm
+reuses resize outputs but recomputes scores, and cached reuses both. See
+[`tests/benchmarks/OFFLINE_BENCHMARK.md`](tests/benchmarks/OFFLINE_BENCHMARK.md).
 
 Benchmark multiple Ollama models:
 
@@ -290,8 +358,8 @@ Benchmark Ollama with and without YOLO context:
 
 Related documentation:
 
-- [`docs/model-quality-speed-comparison.md`](/home/renatobo/devel/pickinsta/docs/model-quality-speed-comparison.md)
-- [`docs/ollama-model-speed-benchmark-report-serverone.md`](/home/renatobo/devel/pickinsta/docs/ollama-model-speed-benchmark-report-serverone.md)
+- [`docs/model-quality-speed-comparison.md`](docs/model-quality-speed-comparison.md)
+- [`docs/ollama-model-speed-benchmark-report-serverone.md`](docs/ollama-model-speed-benchmark-report-serverone.md)
 
 ## Development
 
@@ -302,13 +370,13 @@ make check
 make pre-commit-install
 ```
 
-See [`tests/README.md`](/home/renatobo/devel/pickinsta/tests/README.md) for test coverage notes.
+See [`tests/README.md`](tests/README.md) for test coverage notes.
 
 ## Documentation
 
-Primary docs live under [`docs/`](/home/renatobo/devel/pickinsta/docs):
+Primary docs live under [`docs/`](docs/):
 
-- [`docs/README.md`](/home/renatobo/devel/pickinsta/docs/README.md): documentation index
-- [`docs/composition-rules.md`](/home/renatobo/devel/pickinsta/docs/composition-rules.md): scoring and crop rubric
-- [`docs/troubleshooting.md`](/home/renatobo/devel/pickinsta/docs/troubleshooting.md): install/runtime troubleshooting
-- [`docs/ollama-server-setup.md`](/home/renatobo/devel/pickinsta/docs/ollama-server-setup.md): self-hosted Ollama setup and tuning
+- [`docs/README.md`](docs/README.md): documentation index
+- [`docs/composition-rules.md`](docs/composition-rules.md): scoring and crop rubric
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): install/runtime troubleshooting
+- [`docs/ollama-server-setup.md`](docs/ollama-server-setup.md): self-hosted Ollama setup and tuning

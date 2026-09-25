@@ -143,7 +143,11 @@ def _write_report(
     on = _summarize(on_metrics)
     speedup = 0.0
     if on["avg_sec_per_image"] > 0:
-        speedup = on["avg_sec_per_image"] / off["avg_sec_per_image"] if off["avg_sec_per_image"] > 0 else 0.0
+        speedup = (
+            on["avg_sec_per_image"] / off["avg_sec_per_image"]
+            if off["avg_sec_per_image"] > 0
+            else 0.0
+        )
 
     ts = datetime.now().isoformat(timespec="seconds")
     model = selector.resolve_ollama_model(search_dir=src)
@@ -165,7 +169,9 @@ def _write_report(
     lines.append("")
     lines.append("## Summary")
     lines.append("")
-    lines.append("| Mode | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | Avg mean final score | Avg median final score |")
+    lines.append(
+        "| Mode | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | Avg mean final score | Avg median final score |"
+    )
     lines.append("|---|---:|---:|---:|---:|---:|---:|")
     lines.append(
         f"| YOLO OFF | {off['avg_sec_per_image']:.2f} | {off['avg_images_per_min']:.2f} | {off['avg_duration_sec']:.2f} | {off['avg_failed_count']:.2f} | {off['avg_mean_score']:.4f} | {off['avg_median_score']:.4f} |"
@@ -178,16 +184,16 @@ def _write_report(
     lines.append("")
     if speedup > 0:
         lines.append(f"- YOLO OFF speed factor vs YOLO ON (sec/img): `{speedup:.2f}x`.")
-    lines.append(
-        "- Better throughput means lower `sec/img` and higher `imgs/min`."
-    )
+    lines.append("- Better throughput means lower `sec/img` and higher `imgs/min`.")
     lines.append(
         "- Score deltas (`mean/median final score`) show quality impact when enabling/disabling YOLO context."
     )
     lines.append("")
     lines.append("## Per-run Details")
     lines.append("")
-    lines.append("| Mode | Run | Duration (s) | Sec/img | Imgs/min | Failures | Top1 | Top1 score |")
+    lines.append(
+        "| Mode | Run | Duration (s) | Sec/img | Imgs/min | Failures | Top1 | Top1 score |"
+    )
     lines.append("|---|---:|---:|---:|---:|---:|---|---:|")
     for m in off_metrics + on_metrics:
         mode = "YOLO ON" if m.yolo_enabled else "YOLO OFF"
@@ -266,7 +272,9 @@ def main() -> None:
 
     print(f"🧪 Benchmarking Ollama on {len(candidates)} candidates, {args.runs} run(s) per mode")
     print("➡️  Mode 1/2: YOLO OFF")
-    off_metrics = _benchmark_mode(candidates=candidates, src=src, runs=args.runs, yolo_enabled=False)
+    off_metrics = _benchmark_mode(
+        candidates=candidates, src=src, runs=args.runs, yolo_enabled=False
+    )
     print("➡️  Mode 2/2: YOLO ON")
     on_metrics = _benchmark_mode(candidates=candidates, src=src, runs=args.runs, yolo_enabled=True)
 

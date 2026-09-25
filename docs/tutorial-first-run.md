@@ -19,7 +19,7 @@ After running pickinsta on a folder of event photos, you get:
 
 ## 2. Before you start
 
-**Python version.** You need Python 3.10 or newer.
+**Python version.** You need Python 3.11 through 3.14.
 
 ```bash
 python3 --version

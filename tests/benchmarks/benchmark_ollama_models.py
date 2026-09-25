@@ -18,7 +18,6 @@ from typing import Iterator
 import pickinsta.ig_image_selector as selector
 from pickinsta.ig_image_selector import ImageScore
 
-
 DEFAULT_OLLAMA_MODELS = [
     "qwen3-vl:8b",
     "blaifa/InternVL3_5:8b",
@@ -89,8 +88,7 @@ def _clone_candidates(candidates: list[ImageScore]) -> list[ImageScore]:
 
 def _image_set_hash(candidates: list[ImageScore]) -> str:
     entries = sorted(
-        (str(p := item.source_path or item.path), p.stat().st_size)
-        for item in candidates
+        (str(p := item.source_path or item.path), p.stat().st_size) for item in candidates
     )
     return hashlib.sha256(json.dumps(entries).encode()).hexdigest()[:16]
 
@@ -112,13 +110,17 @@ class BenchmarkStore:
                 return {}
         return {}
 
-    def get_cached_metrics(self, variant: BenchmarkVariant, image_set_hash: str) -> list[RunMetrics] | None:
+    def get_cached_metrics(
+        self, variant: BenchmarkVariant, image_set_hash: str
+    ) -> list[RunMetrics] | None:
         entry = self._load_raw().get(self._variant_key(variant))
         if entry and entry.get("image_set_hash") == image_set_hash:
             return [RunMetrics(**r) for r in entry["runs"]]
         return None
 
-    def store_metrics(self, variant: BenchmarkVariant, metrics: list[RunMetrics], image_set_hash: str) -> None:
+    def store_metrics(
+        self, variant: BenchmarkVariant, metrics: list[RunMetrics], image_set_hash: str
+    ) -> None:
         data = self._load_raw()
         data[self._variant_key(variant)] = {
             "variant": asdict(variant),
@@ -195,7 +197,9 @@ def _ranked_rows(ranked: list[ImageScore]) -> list[dict]:
     return rows
 
 
-def _run_once(*, candidates: list[ImageScore], src: Path, scorer: str) -> tuple[float, list[dict], int]:
+def _run_once(
+    *, candidates: list[ImageScore], src: Path, scorer: str
+) -> tuple[float, list[dict], int]:
     run_candidates = _clone_candidates(candidates)
     t0 = time.perf_counter()
     ranked = selector.batch_vision_score(
@@ -327,9 +331,22 @@ def _write_report(
     lines.append("")
     lines.append("## Speed Summary")
     lines.append("")
-    lines.append("| Variant | Scorer | Model | YOLO | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | SDI | Unique tuples | Speed vs fastest |")
+    lines.append(
+        "| Variant | Scorer | Model | YOLO | Avg sec/img | Avg imgs/min | Avg duration (s) | Avg failures/run | SDI | Unique tuples | Speed vs fastest |"
+    )
     lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|")
-    for label, scorer_name, model, yolo, sec_img, img_min, duration, failures, sdi, unique in summary_rows:
+    for (
+        label,
+        scorer_name,
+        model,
+        yolo,
+        sec_img,
+        img_min,
+        duration,
+        failures,
+        sdi,
+        unique,
+    ) in summary_rows:
         speed_factor = (sec_img / fastest_sec_per_img) if fastest_sec_per_img > 0 else 0.0
         lines.append(
             f"| {_md_escape(label)} | {scorer_name} | {_md_escape(model)} | {yolo} | "
@@ -354,7 +371,9 @@ def _write_report(
         lines.append("")
         variant_labels = [v.label for v in variants if v.label in first_runs]
         images = sorted({row["filename"] for m in first_runs.values() for row in m.ranked_rows})
-        header = "| Image |" + "".join([f" {_md_escape(v)} final | {_md_escape(v)} rank |" for v in variant_labels])
+        header = "| Image |" + "".join(
+            [f" {_md_escape(v)} final | {_md_escape(v)} rank |" for v in variant_labels]
+        )
         sep = "|---|" + "".join(["---:|---:|" for _ in variant_labels])
         lines.append(header)
         lines.append(sep)
@@ -380,7 +399,9 @@ def _write_report(
         lines.append("")
         lines.append(f"### {variant.label}")
         lines.append("")
-        lines.append("| Rank | Image | Final | Tech | Vision | Subject | Light | Color | Emotion | Scroll | Crop | Failed | One line |")
+        lines.append(
+            "| Rank | Image | Final | Tech | Vision | Subject | Light | Color | Emotion | Scroll | Crop | Failed | One line |"
+        )
         lines.append("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|")
         for row in run.ranked_rows:
             lines.append(
@@ -545,7 +566,11 @@ def main() -> None:
     if not candidates:
         raise SystemExit("No candidates selected for benchmark.")
 
-    store = BenchmarkStore(Path(args.results_file).expanduser().resolve()) if args.results_file else None
+    store = (
+        BenchmarkStore(Path(args.results_file).expanduser().resolve())
+        if args.results_file
+        else None
+    )
     image_set_hash = _image_set_hash(candidates)
 
     print(

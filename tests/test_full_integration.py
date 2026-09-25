@@ -98,6 +98,64 @@ def test_run_pipeline_writes_outputs_and_reports(tmp_path, monkeypatch) -> None:
     assert loaded[0]["vision_total"] == 54
     assert loaded[0]["uncertain_crop"] is True
     assert "Top Selected Outputs" in report_md.read_text(encoding="utf-8")
+    manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["processed"] == 1
+    assert manifest["skipped"] == 0
+    assert manifest["failed"] == 0
+    assert set(manifest["stage_timings_seconds"]) == {
+        "burst_reevaluation",
+        "deduplication",
+        "output_generation",
+        "reporting",
+        "resize",
+        "technical_scoring",
+        "vision_scoring",
+    }
+    assert all(count == 1 for count in manifest["stage_invocations"].values())
+    assert manifest["configuration"]["scorer"] == "clip"
+    assert manifest["configuration"]["input_folder"] == str(input_dir)
+    assert "python" in manifest["runtime"]
+    assert manifest["warnings"] == []
+    json.dumps(manifest)
+
+
+def test_managed_artifact_publication_rolls_back_partial_failure(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "selected"
+    staging_dir = output_dir / ".pickinsta-run-test"
+    output_dir.mkdir()
+    staging_dir.mkdir()
+    (output_dir / "selection_report.json").write_text("old report", encoding="utf-8")
+    (output_dir / "user-notes.txt").write_text("keep me", encoding="utf-8")
+    (staging_dir / "01_cropped_a.jpg").write_text("new image", encoding="utf-8")
+    (staging_dir / "selection_report.json").write_text("new report", encoding="utf-8")
+    (staging_dir / "run_manifest.json").write_text('{"status":"complete"}', encoding="utf-8")
+
+    real_replace = selector.os.replace
+
+    def fail_report_publication(source, destination):
+        destination_path = Path(destination)
+        if (
+            destination_path == output_dir / "selection_report.json"
+            and Path(source).parent == staging_dir
+        ):
+            raise OSError("simulated disk failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(selector.os, "replace", fail_report_publication)
+
+    with pytest.raises(OSError, match="simulated disk failure"):
+        selector._publish_managed_artifacts(
+            staging_dir,
+            output_dir,
+            ["01_cropped_a.jpg", "selection_report.json", "run_manifest.json"],
+            completion_artifact="run_manifest.json",
+        )
+
+    assert not (output_dir / "01_cropped_a.jpg").exists()
+    assert (output_dir / "selection_report.json").read_text(encoding="utf-8") == "old report"
+    assert (output_dir / "user-notes.txt").read_text(encoding="utf-8") == "keep me"
+    assert not (output_dir / "run_manifest.json").exists()
 
 
 def test_run_pipeline_skips_padded_variant_when_crop_is_confident(tmp_path, monkeypatch) -> None:
@@ -141,6 +199,14 @@ def test_run_pipeline_skips_padded_variant_when_crop_is_confident(tmp_path, monk
 
     monkeypatch.setattr(selector, "batch_vision_score", fake_batch_vision_score)
     monkeypatch.setattr(selector, "smart_crop", fake_smart_crop)
+    real_copy2 = selector.shutil.copy2
+
+    def fail_hd_copy(source, destination, *args, **kwargs):
+        if "_hd_" in Path(destination).name:
+            raise OSError("simulated HD copy failure")
+        return real_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(selector.shutil, "copy2", fail_hd_copy)
 
     report = selector.run_pipeline(
         input_folder=str(input_dir),
@@ -152,6 +218,15 @@ def test_run_pipeline_skips_padded_variant_when_crop_is_confident(tmp_path, monk
     assert len(report) == 1
     assert report[0]["uncertain_crop"] is False
     assert report[0]["output_full"] is not None
+    manifest = json.loads((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "degraded"
+    assert manifest["processed"] == 1
+    assert manifest["skipped"] == 0
+    assert manifest["failed"] == 1
+    assert manifest["issues"][0]["stage"] == "copy_hd"
+    markdown = (output_dir / "selection_report.md").read_text(encoding="utf-8")
+    assert "Run status: `degraded`" in markdown
+    assert "simulated HD copy failure" in markdown
 
 
 def test_run_pipeline_missing_input_exits(tmp_path) -> None:
@@ -160,7 +235,9 @@ def test_run_pipeline_missing_input_exits(tmp_path) -> None:
         selector.run_pipeline(input_folder=str(missing))
 
 
-def test_run_pipeline_recursive_processes_leaf_folders_and_writes_summary(tmp_path, monkeypatch) -> None:
+def test_run_pipeline_recursive_processes_leaf_folders_and_writes_summary(
+    tmp_path, monkeypatch
+) -> None:
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "selected"
     input_dir.mkdir()
@@ -331,7 +408,9 @@ def test_run_pipeline_claude_crop_first_mode_precrops_before_scoring(tmp_path, m
     crop_calls = []
 
     def fake_smart_crop(image_path, output_path, **kwargs):
-        crop_calls.append({"src_parent": image_path.parent.name, "save_debug": kwargs.get("save_debug")})
+        crop_calls.append(
+            {"src_parent": image_path.parent.name, "save_debug": kwargs.get("save_debug")}
+        )
         _write_image(output_path, width=1080, height=1440)
         return output_path
 

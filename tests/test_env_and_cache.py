@@ -1,7 +1,10 @@
+import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
+import pickinsta.config as config
 import pickinsta.ig_image_selector as selector
 
 
@@ -167,6 +170,24 @@ def test_resolve_ollama_tuning_env(monkeypatch, tmp_path) -> None:
     assert selector.resolve_ollama_circuit_breaker_errors() == 8
 
 
+def test_config_module_is_selector_compatibility_source() -> None:
+    assert selector.resolve_ollama_model is config.resolve_ollama_model
+    assert selector.resolve_anthropic_api_key is config.resolve_anthropic_api_key
+    assert selector.DEFAULT_CLAUDE_MODEL == config.DEFAULT_CLAUDE_MODEL
+
+
+def test_resolve_ollama_settings_returns_frozen_snapshot(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(config.PICKINSTA_OLLAMA_MODEL_ENV_VAR, "vision-model")
+    monkeypatch.setenv(config.OLLAMA_CONCURRENCY_ENV_VAR, "4")
+
+    settings = config.resolve_ollama_settings(search_dir=tmp_path)
+
+    assert settings.model == "vision-model"
+    assert settings.concurrency == 4
+    with pytest.raises(AttributeError):
+        settings.model = "changed"  # type: ignore[misc]
+
+
 def test_claude_model_candidates_include_alias_and_fallbacks() -> None:
     models = selector._claude_model_candidates("claude-sonnet-4-5-20250514")
     assert models[0] == "claude-sonnet-4-5-20250514"
@@ -199,28 +220,186 @@ def test_claude_cache_round_trip_and_validation(tmp_path) -> None:
     )
     assert loaded == vision
 
-    assert selector.load_claude_score_from_file_cache(
-        source_path=source,
-        source_sha256=source_sha,
-        model="different-model",
-        prompt_sha256=prompt_sha,
-    ) is None
+    assert (
+        selector.load_claude_score_from_file_cache(
+            source_path=source,
+            source_sha256=source_sha,
+            model="different-model",
+            prompt_sha256=prompt_sha,
+        )
+        is None
+    )
 
-    assert selector.load_claude_score_from_file_cache(
-        source_path=source,
-        source_sha256=source_sha,
-        model=model,
-        prompt_sha256="different-prompt-hash",
-    ) is None
+    assert (
+        selector.load_claude_score_from_file_cache(
+            source_path=source,
+            source_sha256=source_sha,
+            model=model,
+            prompt_sha256="different-prompt-hash",
+        )
+        is None
+    )
 
     source.write_bytes(b"new bytes")
     new_sha = selector._file_sha256(source)
-    assert selector.load_claude_score_from_file_cache(
+    assert (
+        selector.load_claude_score_from_file_cache(
+            source_path=source,
+            source_sha256=new_sha,
+            model=model,
+            prompt_sha256=prompt_sha,
+        )
+        is None
+    )
+
+
+def test_claude_cache_rejects_old_schema_and_identity_changes(tmp_path) -> None:
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"image")
+    source_sha = selector._file_sha256(source)
+    options = {
+        "use_yolo_context": True,
+        "max_image_edge": 1024,
+        "jpeg_quality": 75,
+        "score_input": "source",
+        "score_input_sha256": source_sha,
+    }
+    selector.save_claude_score_to_file_cache(
         source_path=source,
-        source_sha256=new_sha,
-        model=model,
-        prompt_sha256=prompt_sha,
-    ) is None
+        source_sha256=source_sha,
+        scorer="claude",
+        model="model-a",
+        prompt_sha256="prompt-a",
+        scoring_options=options,
+        vision={"total": 40},
+    )
+
+    common = {
+        "source_path": source,
+        "source_sha256": source_sha,
+        "model": "model-a",
+        "prompt_sha256": "prompt-a",
+        "scoring_options": options,
+    }
+    assert selector.load_claude_score_from_file_cache(**common) == {"total": 40}
+    assert selector.load_claude_score_from_file_cache(**common, scorer="clip") is None
+    assert selector.load_claude_score_from_file_cache(**{**common, "model": "model-b"}) is None
+    changed_options = {**options, "jpeg_quality": 80}
+    assert (
+        selector.load_claude_score_from_file_cache(**{**common, "scoring_options": changed_options})
+        is None
+    )
+
+    cache_file = selector.claude_cache_file_for_source(source)
+    payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    payload.pop("schema_version")
+    cache_file.write_text(json.dumps(payload), encoding="utf-8")
+    assert selector.load_claude_score_from_file_cache(**common) is None
+
+
+def test_claude_cache_options_distinguish_preprocessed_input(tmp_path) -> None:
+    source = tmp_path / "source.jpg"
+    processed = tmp_path / "processed.jpg"
+    source.write_bytes(b"source")
+    processed.write_bytes(b"processed")
+
+    source_options = selector.claude_cache_options(score_path=source, source_path=source)
+    processed_options = selector.claude_cache_options(
+        score_path=processed,
+        source_path=source,
+    )
+
+    assert source_options["score_input"] == "source"
+    assert processed_options["score_input"] == "preprocessed"
+    assert source_options["score_input_sha256"] != processed_options["score_input_sha256"]
+
+
+def test_claude_cache_write_is_atomic(tmp_path) -> None:
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"image")
+
+    selector.save_claude_score_to_file_cache(
+        source_path=source,
+        source_sha256=selector._file_sha256(source),
+        model="model-a",
+        prompt_sha256="prompt-a",
+        vision={"total": 10},
+    )
+
+    cache_file = selector.claude_cache_file_for_source(source)
+    assert json.loads(cache_file.read_text(encoding="utf-8"))["vision"] == {"total": 10}
+    assert list(tmp_path.glob(f".{cache_file.name}.*.tmp")) == []
+
+
+def test_atomic_cache_write_preserves_existing_file_and_cleans_temp(monkeypatch, tmp_path) -> None:
+    cache_file = tmp_path / "cache.json"
+    cache_file.write_text("existing", encoding="utf-8")
+
+    def fail_replace(source, destination) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(selector.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        selector._atomic_write_text(cache_file, "replacement")
+
+    assert cache_file.read_text(encoding="utf-8") == "existing"
+    assert list(tmp_path.glob(f".{cache_file.name}.*.tmp")) == []
+
+
+def test_technical_cache_validates_schema_and_algorithm_fingerprint(monkeypatch, tmp_path) -> None:
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"image")
+    scores = {"composite": 0.75}
+    monkeypatch.setattr(selector, "_technical_algorithm_fingerprint", lambda: "algorithm-a")
+
+    selector._save_tech_cache(source, scores)
+    cache_file = selector._tech_cache_path(source)
+    payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == selector.TECHNICAL_CACHE_SCHEMA_VERSION
+    assert payload["algorithm_fingerprint"] == "algorithm-a"
+    assert selector._load_tech_cache(source) == scores
+
+    payload["schema_version"] += 1
+    cache_file.write_text(json.dumps(payload), encoding="utf-8")
+    assert selector._load_tech_cache(source) is None
+
+    payload["schema_version"] = selector.TECHNICAL_CACHE_SCHEMA_VERSION
+    cache_file.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(selector, "_technical_algorithm_fingerprint", lambda: "algorithm-b")
+    assert selector._load_tech_cache(source) is None
+
+
+def test_real_technical_score_round_trips_through_json_cache(tmp_path) -> None:
+    source = tmp_path / "image.jpg"
+    Image.new("RGB", (320, 240), color=(120, 45, 20)).save(source)
+
+    scores = selector.score_technical(source)
+    assert any(hasattr(value, "item") for value in scores.values())
+
+    selector._save_tech_cache(source, scores)
+    cache_file = selector._tech_cache_path(source)
+    assert cache_file.exists()
+    loaded = selector._load_tech_cache(source)
+
+    assert loaded is not None
+    assert loaded.keys() == scores.keys()
+    assert all(type(value) in (int, float, bool, str) for value in loaded.values())
+
+
+@pytest.mark.parametrize("cache_content", ["{broken", "null", '"not an object"'])
+def test_technical_cache_recovers_from_corrupt_or_wrong_shape_payload(
+    tmp_path, cache_content
+) -> None:
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"image")
+    cache_file = selector._tech_cache_path(source)
+    cache_file.write_text(cache_content, encoding="utf-8")
+
+    assert selector._load_tech_cache(source) is None
+
+    selector._save_tech_cache(source, {"composite": 0.75})
+    assert selector._load_tech_cache(source) == {"composite": 0.75}
 
 
 def test_resolve_yolo_model_path_prefers_env_override(monkeypatch, tmp_path) -> None:

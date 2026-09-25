@@ -6,7 +6,6 @@ import pytest
 
 import pickinsta.ig_image_selector as selector
 
-
 FIXTURE_DIR = Path("tests/cropping")
 CASE_BOXES = {
     "dsc5365": (610, 369, 2369, 1902, "motorcycle", 0.887),
@@ -25,7 +24,9 @@ def _normalized_mae(a: np.ndarray, b: np.ndarray) -> float:
     "case_id",
     ["dsc5365", "dsc5897", "dsc09054", "dsc5660"],
 )
-def test_smart_crop_regression_matches_front_preserve_reference(tmp_path, monkeypatch, case_id) -> None:
+def test_smart_crop_regression_matches_front_preserve_reference(
+    tmp_path, monkeypatch, case_id
+) -> None:
     ext = ".jpg" if case_id == "dsc09054" else ".jpeg"
     src = FIXTURE_DIR / f"{case_id}_original{ext}"
     expected = FIXTURE_DIR / f"{case_id}_front_preserve_expected.jpg"

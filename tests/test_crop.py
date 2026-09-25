@@ -116,11 +116,7 @@ def test_smart_crop_prefers_front_preserve_with_edge_gap(tmp_path, monkeypatch) 
     assert cropped is not None
     assert cropped.shape[:2] == (400, 300)
 
-    green_mask = (
-        (cropped[:, :, 1] > 170)
-        & (cropped[:, :, 0] < 120)
-        & (cropped[:, :, 2] < 120)
-    )
+    green_mask = (cropped[:, :, 1] > 170) & (cropped[:, :, 0] < 120) & (cropped[:, :, 2] < 120)
     green_cols = np.where(green_mask.any(axis=0))[0]
     assert green_cols.size > 0
     # Require a breathing gap from border for the front marker.
@@ -140,7 +136,9 @@ def test_smart_crop_closeup_wide_subject_ignores_unstable_facing(tmp_path, monke
         "yolo_detect_subject",
         lambda _img, debug=False: (100, 40, 800, 320, "motorcycle", 0.95),
     )
-    monkeypatch.setattr(selector, "_expand_subject_bbox", lambda sx, sy, sw, sh, *_a, **_k: (sx, sy, sw, sh))
+    monkeypatch.setattr(
+        selector, "_expand_subject_bbox", lambda sx, sy, sw, sh, *_a, **_k: (sx, sy, sw, sh)
+    )
     monkeypatch.setattr(selector, "_guess_facing_direction", lambda *_args, **_kwargs: "right")
 
     selector.smart_crop(src, out, out_w=300, out_h=400, debug=False, save_debug=True, use_yolo=True)
@@ -166,10 +164,14 @@ def test_smart_crop_tall_rider_subject_forces_top_preserve(tmp_path, monkeypatch
         "yolo_detect_subject",
         lambda _img, debug=False: (180, 0, 440, 1180, "rider_motorcycle", 0.9),
     )
-    monkeypatch.setattr(selector, "_expand_subject_bbox", lambda sx, sy, sw, sh, *_a, **_k: (sx, sy, sw, sh))
+    monkeypatch.setattr(
+        selector, "_expand_subject_bbox", lambda sx, sy, sw, sh, *_a, **_k: (sx, sy, sw, sh)
+    )
     monkeypatch.setattr(selector, "_guess_facing_direction", lambda *_args, **_kwargs: "head-on")
 
-    selector.smart_crop(src, out, out_w=1080, out_h=1440, debug=False, save_debug=True, use_yolo=True)
+    selector.smart_crop(
+        src, out, out_w=1080, out_h=1440, debug=False, save_debug=True, use_yolo=True
+    )
 
     meta_path = tmp_path / "debug_yolo_tall_rider_cropped.jpg.json"
     assert meta_path.exists()
@@ -178,7 +180,9 @@ def test_smart_crop_tall_rider_subject_forces_top_preserve(tmp_path, monkeypatch
     assert payload["crop_window_xywh"][1] == 0
 
 
-def test_smart_crop_overrides_tight_edge_candidate_when_subject_is_wide(tmp_path, monkeypatch) -> None:
+def test_smart_crop_overrides_tight_edge_candidate_when_subject_is_wide(
+    tmp_path, monkeypatch
+) -> None:
     src = tmp_path / "edge_override.jpg"
     out = tmp_path / "edge_override_cropped.jpg"
 
@@ -191,18 +195,16 @@ def test_smart_crop_overrides_tight_edge_candidate_when_subject_is_wide(tmp_path
         "yolo_detect_subject",
         lambda _img, debug=False: (300, 80, 210, 240, "rider_motorcycle", 0.95),
     )
-    monkeypatch.setattr(selector, "_expand_subject_bbox", lambda sx, sy, sw, sh, *_a, **_k: (sx, sy, sw, sh))
+    monkeypatch.setattr(
+        selector, "_expand_subject_bbox", lambda sx, sy, sw, sh, *_a, **_k: (sx, sy, sw, sh)
+    )
     monkeypatch.setattr(selector, "_guess_facing_direction", lambda *_args, **_kwargs: "left")
 
     selector.smart_crop(src, out, out_w=300, out_h=400, debug=False, use_yolo=True)
 
     cropped = cv2.imread(str(out))
     assert cropped is not None
-    white_mask = (
-        (cropped[:, :, 0] > 240)
-        & (cropped[:, :, 1] > 240)
-        & (cropped[:, :, 2] > 240)
-    )
+    white_mask = (cropped[:, :, 0] > 240) & (cropped[:, :, 1] > 240) & (cropped[:, :, 2] > 240)
     white_cols = np.where(white_mask.any(axis=0))[0]
     assert white_cols.size > 0
     # Edge-risk override should avoid a right-edge-tight crop.

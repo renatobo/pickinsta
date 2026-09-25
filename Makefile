@@ -11,10 +11,10 @@ test:
 	$(PYTHON) -m pytest
 
 lint:
-	$(PYTHON) -m ruff check src tests
+	$(PYTHON) -m ruff check .
 
 format:
-	$(PYTHON) -m ruff format src tests
+	$(PYTHON) -m ruff format .
 
 check: lint test
 
